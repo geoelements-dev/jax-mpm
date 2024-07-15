@@ -5,7 +5,8 @@ import h5py
 import os 
 from mpm_utils import * 
 
-def initialize(n_particles, n_grid=100, grid_lim=1.0):
+
+def initialize(n_particles, n_grid=100, grid_lim=1.0,dim=3):
     dx = grid_lim / n_grid
     inv_dx = float(n_grid / grid_lim)
     sin_phi = jnp.sin(25.0 / 180.0 * jnp.pi)  # 25 is friction angle (hard coded for now)
@@ -45,7 +46,7 @@ def initialize(n_particles, n_grid=100, grid_lim=1.0):
         'particle_cov': jnp.zeros(n_particles * 6),
         'particle_F_trial': jnp.zeros((n_particles, 3, 3)),
         'particle_stress': jnp.zeros((n_particles, 3, 3)),
-        'particle_vol': jnp.zeros(n_particles),
+        'particle_vol': jnp.empty(n_particles),
         'particle_mass': jnp.zeros(n_particles),
         'particle_density': jnp.zeros(n_particles),
         'particle_C': jnp.zeros((n_particles, 3, 3)),
@@ -84,12 +85,58 @@ def initialize(n_particles, n_grid=100, grid_lim=1.0):
     "pre_p2g_operations": [],
     "impulse_params": [],
     "particle_velocity_modifiers": [],
-    "particle_velocity_modifier_params": []
+    "particle_velocity_modifier_params": [],
+    "dim":dim
 
 
     }
 
+
     return mpm_simulator 
+
+
+def add_cube(mpm_sim, lower_corner, cube_size, sample_density=None, velocity=None):
+    if sample_density is None:
+        sample_density = 2 ** mpm_sim['dim']
+
+    lower_corner = jnp.array(lower_corner)
+    cube_size = jnp.array(cube_size)
+    vol = jnp.prod(cube_size)
+    num_new_particles = int(sample_density * vol / mpm_sim['mpm_model']['dx'] ** mpm_sim['dim'] + 1)
+    # print(num_new_particles)
+    source_bound = jnp.array([lower_corner,cube_size])
+    # jax.debug.print('{source_bound}', source_bound=source_bound)
+    if velocity is None:
+        velocity = jnp.zeros(3)
+    else:
+        velocity = jnp.array(velocity)
+
+    # Create new particles and update the simulation state
+    mpm_sim = initialize( num_new_particles ,mpm_sim['mpm_model']['n_grid'], mpm_sim['mpm_model']['grid_lim'], mpm_sim['dim'])
+    new_particles = jnp.arange(0,num_new_particles)
+    particle_x = mpm_sim['mpm_state']['particle_x']
+    particle_v = mpm_sim['mpm_state']['particle_v']
+    volume = mpm_sim['mpm_model']['dx'] ** mpm_sim['dim']
+    # volume = 2.5e-8
+        
+        
+    key = jax.random.PRNGKey(1)
+    for i in new_particles:
+        x = jnp.zeros(3)
+        for k in range(mpm_sim['dim']):
+            key, subkey = jax.random.split(key)
+            x = x.at[k].set(source_bound[0, k] + jax.random.uniform(subkey) * (source_bound[1, k]))
+        particle_x = particle_x.at[i].set(x)
+        particle_v = particle_v.at[i].set(velocity)
+
+    mpm_sim['mpm_state']['particle_x'] = particle_x
+    mpm_sim['mpm_state']['particle_v'] = particle_v
+    mpm_sim['mpm_state']['particle_vol'] = jnp.ones(num_new_particles) * volume
+    mpm_sim['mpm_state']['particle_F_trial'] = jnp.array([jnp.eye(3) for _ in range(num_new_particles)])
+
+    return mpm_sim
+
+
 
 def load_from_sampling(sampling_h5, n_grid=100, grid_lim=1.0):
     if not os.path.exists(sampling_h5):
@@ -203,6 +250,65 @@ def finalize_mu_lam(mpm_state, mpm_model):
     return mpm_state, mpm_model
 
 
+def add_grid_boundaries(mpm_sim):
+    mpm_sim['collider_params'].append({})
+    
+    def bound_grid(time, dt, state, model, collider):
+        def body(index, state):
+            grid_x, grid_y, grid_z = jnp.unravel_index(index, state['grid_m'].shape)
+            
+            # Apply boundary conditions on x-axis
+            state['grid_v_out'] = jax.lax.cond(
+                (grid_x < 2) & (state['grid_v_out'][grid_x, grid_y, grid_z][0] < 0),
+                lambda s: s.at[grid_x, grid_y, grid_z, 0].set(0),
+                lambda s: s,
+                state['grid_v_out']
+            )
+            state['grid_v_out'] = jax.lax.cond(
+                (grid_x >= state['grid_m'].shape[0] - 2) & (state['grid_v_out'][grid_x, grid_y, grid_z][0] > 0),
+                lambda s: s.at[grid_x, grid_y, grid_z, 0].set(0),
+                lambda s: s,
+                state['grid_v_out']
+            )
+
+            # Apply boundary conditions on y-axis
+            state['grid_v_out'] = jax.lax.cond(
+                (grid_y < 2) & (state['grid_v_out'][grid_x, grid_y, grid_z][1] < 0),
+                lambda s: s.at[grid_x, grid_y, grid_z, 1].set(0),
+                lambda s: s,
+                state['grid_v_out']
+            )
+            state['grid_v_out'] = jax.lax.cond(
+                (grid_y >= state['grid_m'].shape[1] - 2) & (state['grid_v_out'][grid_x, grid_y, grid_z][1] > 0),
+                lambda s: s.at[grid_x, grid_y, grid_z, 1].set(0),
+                lambda s: s,
+                state['grid_v_out']
+            )
+
+            # Apply boundary conditions on z-axis
+            state['grid_v_out'] = jax.lax.cond(
+                (grid_z < 2) & (state['grid_v_out'][grid_x, grid_y, grid_z][2] < 0),
+                lambda s: s.at[grid_x, grid_y, grid_z, 2].set(0),
+                lambda s: s,
+                state['grid_v_out']
+            )
+            state['grid_v_out'] = jax.lax.cond(
+                (grid_z >= state['grid_m'].shape[2] - 2) & (state['grid_v_out'][grid_x, grid_y, grid_z][2] > 0),
+                lambda s: s.at[grid_x, grid_y, grid_z, 2].set(0),
+                lambda s: s,
+                state['grid_v_out']
+            )
+
+            return state
+
+        num_elements = jnp.prod(jnp.array(state['grid_m'].shape))
+        state = jax.lax.fori_loop(0, num_elements, body, state)
+        return state
+
+    mpm_sim['grid_postprocess'].append(bound_grid)
+    mpm_sim['modify_bc'].append(None)
+    return mpm_sim
+
 def add_surface_collider(mpm_sim,point,
         normal,
         surface="sticky",
@@ -228,7 +334,6 @@ def add_surface_collider(mpm_sim,point,
     }
     mpm_sim['collider_params'].append(collider_param)
 
-
     def collide(time, dt, state, model, collider):
         def update_velocity(grid_x, grid_y, grid_z, state, model, collider, time):
             offset = jnp.array([
@@ -238,9 +343,12 @@ def add_surface_collider(mpm_sim,point,
             ])
             n = collider['normal']
             dotproduct = jnp.dot(offset, n)
+            # jax.debug.print('{dotproduct}', dotproduct=dotproduct)
 
             def set_zero_velocity(state):
                 state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(jnp.zeros(3))
+                # jax.debug.print('zero vel')
+
                 return state 
             
             def handle_surface_type(state, v):
@@ -255,7 +363,7 @@ def add_surface_collider(mpm_sim,point,
                 def apply_friction(v):
                     return jax.lax.cond(
                         normal_component < 0.0,
-                        lambda: jnp.maximum(0.0, jnp.linalg.norm(v) + normal_component * collider['friction']) * v / jnp.linalg.norm(v),
+                        lambda: jnp.maximum(0.0, jnp.linalg.norm(v) + normal_component * collider['friction']) * (v / jnp.linalg.norm(v)),
                         lambda: v
                     )
 
@@ -340,14 +448,54 @@ def p2g2p(mpm_sim,step, dt, device="cuda:0"):
 
     grid_size = (mpm_model['grid_dim_x'], mpm_model['grid_dim_y'], mpm_model['grid_dim_z'])
 
+    # minimum_y = jnp.min(mpm_state['particle_x'][:,1])
+    argmin_y = jnp.argmin(mpm_state['particle_x'][:,1])
+    argmax_y = jnp.argmax(mpm_state['particle_x'][:,1])
+
+
+    grid_pos_min = mpm_state['particle_x'][argmin_y] * mpm_model['inv_dx']
+    base_pos_min = (grid_pos_min - 0.5).astype(jnp.int32)
+
+    grid_pos_max = mpm_state['particle_x'][argmax_y] * mpm_model['inv_dx']
+    base_pos_max =(grid_pos_max - 0.5).astype(jnp.int32)
+
+
+    log_array('jax_log_base_pos_bottom.txt', 'base_pos', base_pos_min, step, "Base pos of bottom particle")
+    log_array('jax_log_base_pos_top.txt', 'base_pos', base_pos_max, step, "Base pos of top particle")
     
+    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"Before zero grid")
+    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"Before zero grid")
+
+
+    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"Before zero grid")
+    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"Before zero grid")
+
+
+    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"Before zero grid")
+    log_array('jax_log_pmass_top.txt', 'particle_mass', np.array(mpm_state['particle_mass'][argmax_y]), step,"Before zero grid")
+
     mpm_state = zero_grid(mpm_state, grid_size)
 
-    for operation,params in zip(mpm_sim['pre_p2g_operations'],mpm_sim['impulse_params']):
-        mpm_state = operation(mpm_sim['time'], dt, mpm_state, params)
 
-    for modifier, params in zip(mpm_sim['particle_velocity_modifiers'], mpm_sim['particle_velocity_modifier_params']):
-        mpm_state = modifier(mpm_sim['time'], mpm_state, params)
+
+    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"After zero grid")
+    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"After zero grid")
+    log_array('jax_log_pmass_top.txt', 'particle_mass', np.array(mpm_state['particle_mass'][argmax_y]), step,"After zero grid")
+    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"After zero grid")
+
+
+
+    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"After zero grid")
+    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"After zero grid")
+
+    # log_array('jax_log_grid_v_in.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][0]), step,"After zero grid")
+    # log_array('jax_log_grid_v_out.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][0]), step,"After zero grid")
+
+    # for operation,params in zip(mpm_sim['pre_p2g_operations'],mpm_sim['impulse_params']):
+    #     mpm_state = operation(mpm_sim['time'], dt, mpm_state, params)
+
+    # for modifier, params in zip(mpm_sim['particle_velocity_modifiers'], mpm_sim['particle_velocity_modifier_params']):
+    #     mpm_state = modifier(mpm_sim['time'], mpm_state, params)
 
     
 
@@ -358,9 +506,31 @@ def p2g2p(mpm_sim,step, dt, device="cuda:0"):
     mpm_state = p2g_apic_with_stress(mpm_state, mpm_model, dt)
     # print(mpm_state['grid_v_in'][51,48,29])
 
-    
+
+    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After P2G Particle grid : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After P2G Particle grid : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_pmass_top.txt', 'particle_mass', np.array(mpm_state['particle_mass'][argmax_y]), step,f"After P2G Particle grid")
+    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After P2G Particle grid : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+
+
+
+    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After P2G Particle grid : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After P2G Particle grid : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+
     mpm_state = grid_normalization_and_gravity(mpm_state, mpm_model, dt)
     # print(mpm_state['grid_v_in'][51,48,29])
+
+
+
+    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After grid norm : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After grid norm : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After grid norm : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+
+
+
+    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After grid norm : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After grid norm : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+
 
     if mpm_model['grid_v_damping_scale'] < 1.0:
         mpm_state = add_damping_via_grid(mpm_state, mpm_model['grid_v_damping_scale'])
@@ -369,6 +539,7 @@ def p2g2p(mpm_sim,step, dt, device="cuda:0"):
 
 
     for k in range(len(mpm_sim['grid_postprocess'])):
+        print("hi")
         mpm_state = mpm_sim['grid_postprocess'][k](mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][k])
         if mpm_sim['modify_bc'][k] is not None:
             mpm_sim['modify_bc'][k](mpm_sim['time'], mpm_state, mpm_model, mpm_sim['collider_params'][k])
@@ -376,7 +547,25 @@ def p2g2p(mpm_sim,step, dt, device="cuda:0"):
     # print(mpm_state['grid_v_in'][51,48,29])
 
 
+
+    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After BC : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After BC : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After BC : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+
+
+    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After BC : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After BC : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+
     mpm_state = g2p(mpm_state, mpm_model, dt)
+
+
+    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After G2P : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After G2P : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After G2P : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+
+    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After G2P : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}") 
+    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After G2P : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+
     # print(mpm_state['grid_v_in'][51,48,29])
 
     mpm_sim['time'] += dt

@@ -4,6 +4,22 @@ from jax import jit
 import os 
 import numpy as np
 
+
+
+def log_array(filename, array_name, array, step, comments=""):
+    # Convert to NumPy array if the array is not already one
+    if not isinstance(array, np.ndarray):
+        array = np.array(array)
+        
+    with open(filename, 'a') as f:
+        f.write(f"Step {step}: {array_name} | Comments: {comments}\n")
+        if array.ndim == 0:
+            # Handle 0-dimensional array
+            f.write(f"{array.item()}\n")
+        else:
+            np.savetxt(f, array, delimiter=',')
+        f.write("\n\n")
+
 def zero_grid(state, grid_size):
     state['grid_m'] = jnp.zeros(grid_size)
     state['grid_v_in'] = jnp.zeros(grid_size + (3,))
@@ -34,12 +50,14 @@ def svd3(F):
 def sand_return_mapping(F_trial, state, model, p):
     U, sig, V = svd3(F_trial)
 
-    epsilon = jnp.log(jnp.clip(jnp.abs(sig), 1e-14))
+    epsilon = jnp.array([jnp.log(jnp.clip(jnp.abs(sig[0]),1e-14)), jnp.log(jnp.clip(jnp.abs(sig[1]),1e-14)), jnp.log(jnp.clip(jnp.abs(sig[0]),1e-14))])
     tr = jnp.sum(epsilon)
     epsilon_hat = epsilon - tr / 3.0
     epsilon_hat_norm = jnp.linalg.norm(epsilon_hat)
-    delta_gamma = epsilon_hat_norm + ((3.0 * model['lam'][p] + 2.0 * model['mu'][p]) / (2.0 * model['mu'][p])) * tr * model['alpha']
+    delta_gamma = epsilon_hat_norm + (3.0 * model['lam'][p] + 2.0 * model['mu'][p]) / (2.0 * model['mu'][p]) * tr * model['alpha']
     # jax.debug.print("{delta_gamma}", delta_gamma=model['mu'][p])
+    # jax.debug.callback(log_array,('jax_log.txt', 'delta_gamma', delta_gamma, 0))
+
     F_elastic = jax.lax.select(
         delta_gamma <= 0,
         F_trial,
@@ -107,7 +125,7 @@ def p2g_apic_with_stress(state, model, dt):
             stress = state['particle_stress'][p]
             grid_pos = state['particle_x'][p] * model['inv_dx']
             base_pos = (grid_pos - 0.5).astype(jnp.int32)
-            fx = grid_pos - base_pos
+            fx = grid_pos - base_pos.astype(jnp.float32)
             wa = 1.5 - fx
             wb = fx - 1.0
             wc = fx - 0.5
@@ -115,14 +133,14 @@ def p2g_apic_with_stress(state, model, dt):
                 0.5 * wa ** 2,
                 0.75 - wb ** 2,
                 0.5 * wc ** 2
-            ])
+            ]).T
             dw = jnp.array([
                 fx - 1.5,
                 -2.0 * (fx - 1.0),
                 fx - 0.5
-            ])
+            ]).T
 
-            def inner_body(ijk, val):
+            def inner_body(ijk, state):
                 i, j, k = jnp.unravel_index(ijk, (3, 3, 3))
                 dpos = (jnp.array([i, j, k]) - fx) * model['dx']
                 ix, iy, iz = base_pos + jnp.array([i, j, k])
@@ -143,11 +161,11 @@ def p2g_apic_with_stress(state, model, dt):
                     weight * state['particle_mass'][p] * (state['particle_v'][p] + C @ dpos)
                     + dt * elastic_force
                 )
-                # jax.debug.print("{v_in_add}", v_in_add=C)
+                # jax.debug.print("{v_in_add}", v_in_add=stress)
                 
-                val['grid_v_in'] = val['grid_v_in'].at[ix, iy, iz].add(v_in_add)
-                val['grid_m'] = val['grid_m'].at[ix, iy, iz].add(weight * state['particle_mass'][p])
-                return val
+                state['grid_v_in'] = state['grid_v_in'].at[ix, iy, iz].add(v_in_add)
+                state['grid_m'] = state['grid_m'].at[ix, iy, iz].add(weight * state['particle_mass'][p])
+                return state
 
             state = jax.lax.fori_loop(
                 0, 27 , inner_body, state
@@ -192,6 +210,7 @@ def grid_normalization_and_gravity(state, model, dt):
         return state
 
     num_elements = state['grid_m'].size
+    jax.debug.print("{num_elements}", num_elements=num_elements)
     state = jax.lax.fori_loop(0, num_elements, body, state)
     return state
 
@@ -221,9 +240,8 @@ def g2p(state, model, dt):
 
         def inside_fun(p,state):
             grid_pos = state['particle_x'][p] * model['inv_dx']
-            base_pos = jnp.floor(grid_pos - 0.5).astype(int)
-            fx = grid_pos - (base_pos)
-            
+            base_pos = (grid_pos - 0.5).astype(jnp.int32)
+            fx = grid_pos - (base_pos).astype(jnp.float32)
             wa = 1.5 - fx
             wb = fx - 1.0
             wc = fx - 0.5
@@ -231,13 +249,13 @@ def g2p(state, model, dt):
                 0.5 * wa ** 2,
                 0.75 - wb ** 2,
                 0.5 * wc ** 2
-            ])
+            ]).T
             
             dw = jnp.array([
                 fx - 1.5,
                 -2.0 * (fx - 1.0),
                 fx - 0.5
-            ])
+            ]).T
             
             new_v = jnp.zeros(3)
             new_C = jnp.zeros((3, 3))
