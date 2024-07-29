@@ -4,7 +4,7 @@ import numpy as np
 import h5py
 import os 
 from mpm_utils import * 
-
+import time 
 
 def initialize(n_particles, n_grid=100, grid_lim=1.0,dim=3):
     dx = grid_lim / n_grid
@@ -334,102 +334,110 @@ def add_surface_collider(mpm_sim,point,
     }
     mpm_sim['collider_params'].append(collider_param)
 
-    def collide(time, dt, state, model, collider):
-        def update_velocity(grid_x, grid_y, grid_z, state, model, collider, time):
-            offset = jnp.array([
-                grid_x * model['dx'] - collider['point'][0],
-                grid_y * model['dx'] - collider['point'][1],
-                grid_z * model['dx'] - collider['point'][2]
-            ])
-            n = collider['normal']
-            dotproduct = jnp.dot(offset, n)
-            # jax.debug.print('{dotproduct}', dotproduct=dotproduct)
-
-            def set_zero_velocity(state):
-                state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(jnp.zeros(3))
-                # jax.debug.print('zero vel')
-
-                return state 
-            
-            def handle_surface_type(state, v):
-                normal_component = jnp.dot(v, n)
-                
-                def project_out_normal(v, n):
-                    return v - normal_component * n
-                
-                def project_out_inward_normal(v, n):
-                    return v - jnp.minimum(normal_component, 0.0) * n
-                
-                def apply_friction(v):
-                    return jax.lax.cond(
-                        normal_component < 0.0,
-                        lambda: jnp.maximum(0.0, jnp.linalg.norm(v) + normal_component * collider['friction']) * (v / jnp.linalg.norm(v)),
-                        lambda: v
-                    )
-
-                v = jax.lax.cond(
-                    collider['surface_type'] == 1,
-                    lambda v: project_out_normal(v, n),
-                    lambda v: project_out_inward_normal(v, n),
-                    v
-                )
-                v = jax.lax.cond(
-                    (normal_component < 0.0) & (jnp.linalg.norm(v) > 1e-20),
-                    lambda v: apply_friction(v),
-                    lambda v: v,
-                    v
-                )
-                
-                state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(v) 
-                return state
-            
-
-            def type_11_condition(state):
-                v_in = state['grid_v_out'][grid_x, grid_y, grid_z]
-                state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(jnp.array([v_in[0], 0.0, v_in[2]]) * 0.3)
-                return state
-            
-            def inner_condition():
-                return jax.lax.cond(
-                    collider['surface_type'] == 0,
-                    lambda state: set_zero_velocity(state),
-                    lambda state: jax.lax.cond(
-                        collider['surface_type'] == 11,
-                        lambda state: jax.lax.cond(
-                            (grid_z * model['dx'] < 0.4) | (grid_z * model['dx'] > 0.53),
-                            lambda state: set_zero_velocity(state),
-                            lambda state: type_11_condition(state),
-                            state
-                        ),
-                        lambda state: handle_surface_type(state, state['grid_v_out'][grid_x, grid_y, grid_z]),
-                        state
-                    ),
-                    state
-
-                )
-
-            return jax.lax.cond(dotproduct < 0.0, inner_condition, lambda: state)
-
-        grid_shape = state['grid_v_out'].shape[:3]
-        grid_x, grid_y, grid_z = jnp.indices(grid_shape)
-
-        def outer_condition(state):
-            return jax.lax.cond(
-                (time >= collider['start_time']) & (time < collider['end_time']),
-                lambda state: jax.lax.fori_loop(0, grid_shape[0] * grid_shape[1] * grid_shape[2], 
-                                                 lambda i, state: update_velocity(*jnp.unravel_index(i, grid_shape), state, model, collider, time),
-                                                 state),
-                lambda state: state,
-                state
-            )
-
-        return outer_condition(state)
-    
-
-    mpm_sim['grid_postprocess'].append(collide)
+   
+    mpm_sim['grid_postprocess'].append(collider_param)
     mpm_sim['modify_bc'].append(None)
     return mpm_sim
 
+@jax.jit
+def collide(time, dt, state, model, collider):
+    grid_shape = state['grid_v_out'].shape[:3]
+
+    def update_velocity(grid_x,grid_y,grid_z, state, model, collider, time):
+        offset = jnp.array([
+            grid_x * model['dx'] - collider['point'][0],
+            grid_y * model['dx'] - collider['point'][1],
+            grid_z * model['dx'] - collider['point'][2]
+        ])
+        n = collider['normal']
+        dotproduct = jnp.dot(offset, n)
+        # jax.debug.print('{dotproduct}', dotproduct=dotproduct)
+
+        def set_zero_velocity(state):
+            # state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(jnp.zeros(3))
+            # jax.debug.print('zero vel')
+
+            return jnp.zeros(3) 
+        
+        def handle_surface_type(state, v):
+            normal_component = jnp.dot(v, n)
+            
+            def project_out_normal(v, n):
+                return v - normal_component * n
+            
+            def project_out_inward_normal(v, n):
+                return v - jnp.minimum(normal_component, 0.0) * n
+            
+            def apply_friction(v):
+                return jax.lax.cond(
+                    normal_component < 0.0,
+                    lambda: jnp.maximum(0.0, jnp.linalg.norm(v) + normal_component * collider['friction']) * (v / jnp.linalg.norm(v)),
+                    lambda: v
+                )
+
+            v = jax.lax.cond(
+                collider['surface_type'] == 1,
+                lambda v: project_out_normal(v, n),
+                lambda v: project_out_inward_normal(v, n),
+                v
+            )
+            v = jax.lax.cond(
+                (normal_component < 0.0) & (jnp.linalg.norm(v) > 1e-20),
+                lambda v: apply_friction(v),
+                lambda v: v,
+                v
+            )
+            
+            # state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(v) 
+            return v
+        
+
+        def type_11_condition(state):
+            v_in = state['grid_v_out'][grid_x, grid_y, grid_z]
+            # state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(jnp.array([v_in[0], 0.0, v_in[2]]) * 0.3)
+            return jnp.array([v_in[0], 0.0, v_in[2]]) * 0.3
+        
+        def inner_condition():
+            return jax.lax.cond(
+                collider['surface_type'] == 0,
+                lambda state: set_zero_velocity(state),
+                lambda state: jax.lax.cond(
+                    collider['surface_type'] == 11,
+                    lambda state: jax.lax.cond(
+                        (grid_z * model['dx'] < 0.4) | (grid_z * model['dx'] > 0.53),
+                        lambda state: set_zero_velocity(state),
+                        lambda state: type_11_condition(state),
+                        state
+                    ),
+                    lambda state: handle_surface_type(state, state['grid_v_out'][grid_x, grid_y, grid_z]),
+                    state
+                ),
+                state
+
+            )
+
+        return jax.lax.cond(dotproduct < 0.0, inner_condition, lambda: state['grid_v_out'][grid_x, grid_y, grid_z])
+
+    # grid_x, grid_y, grid_z = jnp.indices(grid_shape)
+    vmapped_update_velocity = jax.vmap(
+        jax.vmap(
+            jax.vmap(update_velocity, in_axes=(None, None, 0, None, None, None, None)),
+            in_axes=(None, 0, None, None, None, None, None)
+        ),
+        in_axes=(0, None, None, None, None, None, None)
+    )
+    
+    def outer_condition(state):
+        return jax.lax.cond(
+            (time >= collider['start_time']) & (time < collider['end_time']),
+            lambda state: vmapped_update_velocity(jnp.arange(grid_shape[0]), jnp.arange(grid_shape[1]), jnp.arange(grid_shape[2]), state, model, collider, time),
+            lambda state: state['grid_v_out'],
+            state
+        )
+
+    state['grid_v_out'] = outer_condition(state)
+    return state
+    
 
 
 
@@ -439,137 +447,90 @@ def add_surface_collider(mpm_sim,point,
 
 
 
+def p2g2p(mpm_sim, step, dt):
+    start = time.time()
 
-
-
-def p2g2p(mpm_sim,step, dt, device="cuda:0"):
     mpm_state = mpm_sim['mpm_state']
     mpm_model = mpm_sim['mpm_model']
+    end = time.time()
+    jax.debug.print("Time taken to unpack: {time}", time = end - start)
+    # grid_size = jnp.array([mpm_model['grid_dim_x'], mpm_model['grid_dim_y'], mpm_model['grid_dim_z']])
 
-    grid_size = (mpm_model['grid_dim_x'], mpm_model['grid_dim_y'], mpm_model['grid_dim_z'])
+    start = time.time()
 
-    # minimum_y = jnp.min(mpm_state['particle_x'][:,1])
-    argmin_y = jnp.argmin(mpm_state['particle_x'][:,1])
-    argmax_y = jnp.argmax(mpm_state['particle_x'][:,1])
+    mpm_state = zero_grid(mpm_state)
+    jax.block_until_ready(mpm_state['grid_v_out'])
 
+    end = time.time()
+    jax.debug.print("Zero grid time: {time} ",time= end - start)
 
-    grid_pos_min = mpm_state['particle_x'][argmin_y] * mpm_model['inv_dx']
-    base_pos_min = (grid_pos_min - 0.5).astype(jnp.int32)
-
-    grid_pos_max = mpm_state['particle_x'][argmax_y] * mpm_model['inv_dx']
-    base_pos_max =(grid_pos_max - 0.5).astype(jnp.int32)
-
-
-    log_array('jax_log_base_pos_bottom.txt', 'base_pos', base_pos_min, step, "Base pos of bottom particle")
-    log_array('jax_log_base_pos_top.txt', 'base_pos', base_pos_max, step, "Base pos of top particle")
-    
-    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"Before zero grid")
-    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"Before zero grid")
-
-
-    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"Before zero grid")
-    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"Before zero grid")
-
-
-    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"Before zero grid")
-    log_array('jax_log_pmass_top.txt', 'particle_mass', np.array(mpm_state['particle_mass'][argmax_y]), step,"Before zero grid")
-
-    mpm_state = zero_grid(mpm_state, grid_size)
-
-
-
-    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"After zero grid")
-    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"After zero grid")
-    log_array('jax_log_pmass_top.txt', 'particle_mass', np.array(mpm_state['particle_mass'][argmax_y]), step,"After zero grid")
-    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,"After zero grid")
-
-
-
-    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"After zero grid")
-    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,"After zero grid")
-
-    # log_array('jax_log_grid_v_in.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][0]), step,"After zero grid")
-    # log_array('jax_log_grid_v_out.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][0]), step,"After zero grid")
-
-    # for operation,params in zip(mpm_sim['pre_p2g_operations'],mpm_sim['impulse_params']):
-    #     mpm_state = operation(mpm_sim['time'], dt, mpm_state, params)
-
-    # for modifier, params in zip(mpm_sim['particle_velocity_modifiers'], mpm_sim['particle_velocity_modifier_params']):
-    #     mpm_state = modifier(mpm_sim['time'], mpm_state, params)
-
-    
-
+    start = time.time()
     mpm_state = compute_stress_from_F_trial(mpm_state, mpm_model, dt)
+    jax.block_until_ready(mpm_state['particle_stress'])
 
-    # print(mpm_state['grid_v_in'][51,48,29])
+    end = time.time()
+    jax.debug.print("Compute stress time: {time} ",time= end - start)
 
+    start = time.time()
     mpm_state = p2g_apic_with_stress(mpm_state, mpm_model, dt)
-    # print(mpm_state['grid_v_in'][51,48,29])
+    jax.block_until_ready(mpm_state['grid_v_in'])
+    end = time.time()
+    jax.debug.print("P2G time: {time} ", time = end - start)
 
-
-    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After P2G Particle grid : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After P2G Particle grid : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_pmass_top.txt', 'particle_mass', np.array(mpm_state['particle_mass'][argmax_y]), step,f"After P2G Particle grid")
-    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After P2G Particle grid : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-
-
-
-    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After P2G Particle grid : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
-    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After P2G Particle grid : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
-
+    start = time.time()
     mpm_state = grid_normalization_and_gravity(mpm_state, mpm_model, dt)
-    # print(mpm_state['grid_v_in'][51,48,29])
+    jax.block_until_ready(mpm_state['grid_v_out'])
 
+    end = time.time()
+    jax.debug.print("Grid normalization time: {time} ", time = end - start)
 
+    # Convert the if statement to JAX compatible using lax.cond
 
-    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After grid norm : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After grid norm : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After grid norm : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
+    mpm_state = jax.lax.cond(
+        mpm_model['grid_v_damping_scale'] < 1.0,
+        lambda mpm_state: add_damping_via_grid(mpm_state, mpm_model['grid_v_damping_scale']),
+        lambda mpm_state: mpm_state,
+        mpm_state
+    )
+   
+    # Convert the other if statement to JAX compatible using lax.cond
+    def apply_postprocess_and_bc(mpm_state):
+        mpm_state = collide(mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][0])
+        # mpm_state = jax.lax.cond(
+        #     mpm_sim['modify_bc'][0] is not None,
+        #     lambda mpm_state: mpm_sim['modify_bc'][0](mpm_sim['time'], mpm_state, mpm_model, mpm_sim['collider_params'][0]),
+        #     lambda mpm_state: mpm_state,
+        #     mpm_state
+        # )
+        return mpm_state
 
+    start = time.time()
+    mpm_state = apply_postprocess_and_bc(mpm_state)
+    jax.block_until_ready(mpm_state['grid_v_out'])
 
+    end = time.time()
+    jax.debug.print("Apply postprocess time: {time} ",time= end - start)
 
-    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After grid norm : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
-    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After grid norm : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
+    # jax.debug.print("Printing state :{s} ", s = mpm_state)
 
-
-    if mpm_model['grid_v_damping_scale'] < 1.0:
-        mpm_state = add_damping_via_grid(mpm_state, mpm_model['grid_v_damping_scale'])
-
-    # print(mpm_state['grid_v_in'][51,48,29])
-
-
-    for k in range(len(mpm_sim['grid_postprocess'])):
-        print("hi")
-        mpm_state = mpm_sim['grid_postprocess'][k](mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][k])
-        if mpm_sim['modify_bc'][k] is not None:
-            mpm_sim['modify_bc'][k](mpm_sim['time'], mpm_state, mpm_model, mpm_sim['collider_params'][k])
-
-    # print(mpm_state['grid_v_in'][51,48,29])
-
-
-
-    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After BC : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After BC : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After BC : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-
-
-    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After BC : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
-    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After BC : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
-
+    start = time.time()
     mpm_state = g2p(mpm_state, mpm_model, dt)
+    jax.block_until_ready(mpm_state['particle_F_trial'])
 
-
-    log_array('jax_log_grid_v_in_top.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After G2P : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_grid_v_out_top.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After G2P : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-    log_array('jax_log_grid_m_top.txt', 'grid_m', np.array(mpm_state['grid_m'][base_pos_max[0],base_pos_max[1],base_pos_max[2]]), step,f"After G2P : {base_pos_max[0]} {base_pos_max[1]} {base_pos_max[2]}")
-
-    log_array('jax_log_grid_v_in_bottom.txt', 'grid_v_in', np.array(mpm_state['grid_v_in'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After G2P : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}") 
-    log_array('jax_log_grid_v_out_bottom.txt', 'grid_v_out', np.array(mpm_state['grid_v_out'][base_pos_min[0],base_pos_min[1],base_pos_min[2]]), step,f"After G2P : {base_pos_min[0]} {base_pos_min[1]} {base_pos_min[2]}")
-
-    # print(mpm_state['grid_v_in'][51,48,29])
+    end = time.time()
+    jax.debug.print("G2P time: {time}", time = end - start)
 
     mpm_sim['time'] += dt
     mpm_sim['mpm_state'] = mpm_state
-
+    jax.debug.print("Ho")
     return mpm_sim
+
+# def mpm_solve(mpm_solver,n_steps,dt):
+#     #give a jax.lax for loop 
+#     def body(i, ms):
+#         return p2g2p(ms,i,dt)
+    
+
+#     mpm_solver = jax.lax.fori_loop(0, n_steps, body, mpm_solver)
+#     return mpm_solver
 

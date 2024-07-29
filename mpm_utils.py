@@ -20,16 +20,21 @@ def log_array(filename, array_name, array, step, comments=""):
             np.savetxt(f, array, delimiter=',')
         f.write("\n\n")
 
-def zero_grid(state, grid_size):
-    state['grid_m'] = jnp.zeros(grid_size)
-    state['grid_v_in'] = jnp.zeros(grid_size + (3,))
-    state['grid_v_out'] = jnp.zeros(grid_size + (3,))
+@jax.jit
+def zero_grid(state):
+    state['grid_m']=state['grid_m'].at[:,:,:].set(0)
+    state['grid_v_in']=state['grid_v_in'].at[:,:,:,:].set(0)
+    state['grid_v_out']=state['grid_v_out'].at[:,:,:,:].set(0)
     return state
+    
 
+
+@jax.jit
 def add_damping_via_grid(state, scale):
     state['grid_v_out'] = state['grid_v_out'] * scale
     return state
 
+@jax.jit
 def compute_mu_lam_from_E_nu(mpm_state, mpm_model):
     E = mpm_model['E']
     nu = mpm_model['nu']
@@ -41,12 +46,12 @@ def compute_mu_lam_from_E_nu(mpm_state, mpm_model):
 
     return mpm_state, mpm_model
 
-
+@jax.jit
 def svd3(F):
     U, S, Vh = jnp.linalg.svd(F)
     return U, S, Vh.T
 
-
+@jax.jit
 def sand_return_mapping(F_trial, state, model, p):
     U, sig, V = svd3(F_trial)
 
@@ -70,7 +75,7 @@ def sand_return_mapping(F_trial, state, model, p):
 
     return F_elastic
 
-
+@jax.jit
 def kirchoff_stress_drucker_prager(F, U, V, sig, mu, lam):
     log_sig_sum = jnp.log(sig[0]) + jnp.log(sig[1]) + jnp.log(sig[2])
     center00 = 2.0 * mu * jnp.log(sig[0]) * (1.0 / sig[0]) + lam * log_sig_sum * (1.0 / sig[0])
@@ -82,11 +87,13 @@ def kirchoff_stress_drucker_prager(F, U, V, sig, mu, lam):
 
 
 
+@jax.jit
 def compute_stress_from_F_trial(state, model, dt):
     def body(p, state):
         F_trial = state['particle_F_trial'][p]
 
         def compute_if_selected_0(state):
+
             F = sand_return_mapping(F_trial, state, model, p)
             # jax.debug.print("{v_in_add}", v_in_add=F)
 
@@ -95,20 +102,21 @@ def compute_stress_from_F_trial(state, model, dt):
             stress = kirchoff_stress_drucker_prager(F, U, V, sig, model['mu'][p], model['lam'][p])
 
             stress = (stress + stress.T) / 2.0  
-            state['particle_F'] = state['particle_F'].at[p].set(F)
-            state['particle_stress'] = state['particle_stress'].at[p].set(stress)
-            return state
+            # state['particle_F'] = state['particle_F'].at[p].set(F)
+            # state['particle_stress'] = state['particle_stress'].at[p].set(stress)
+            return F,stress
         
         def compute_else(state):
-            return state
+            return state['particle_F'][p], state['particle_stress'][p]
         
-        state = jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,state)
-        return state
+        pF,pS = jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,state)
+        return pF,pS
 
-    state = jax.lax.fori_loop(0, state['particle_F'].shape[0], body, state)
+    vmap_body = jax.vmap(body, in_axes=(0, None))
+    state['particle_F'], state['particle_stress'] = vmap_body(jnp.arange(state['particle_F'].shape[0]), state)
     return state
 
-
+@jax.jit
 def compute_dweight(model, w, dw, i, j, k):
     dweight = jnp.array([
         dw[0, i] * w[1, j] * w[2, k],
@@ -118,7 +126,7 @@ def compute_dweight(model, w, dw, i, j, k):
     return dweight * model['inv_dx']
 
 
-
+@jax.jit
 def p2g_apic_with_stress(state, model, dt):
     def body(p, state):
         def compute_if_selected_0(state):
@@ -140,8 +148,8 @@ def p2g_apic_with_stress(state, model, dt):
                 fx - 0.5
             ]).T
 
-            def inner_body(ijk, state):
-                i, j, k = jnp.unravel_index(ijk, (3, 3, 3))
+
+            def inner_body(i,j,k, state):
                 dpos = (jnp.array([i, j, k]) - fx) * model['dx']
                 ix, iy, iz = base_pos + jnp.array([i, j, k])
                 weight = w[0, i] * w[1, j] * w[2, k]
@@ -163,59 +171,95 @@ def p2g_apic_with_stress(state, model, dt):
                 )
                 # jax.debug.print("{v_in_add}", v_in_add=stress)
                 
-                state['grid_v_in'] = state['grid_v_in'].at[ix, iy, iz].add(v_in_add)
-                state['grid_m'] = state['grid_m'].at[ix, iy, iz].add(weight * state['particle_mass'][p])
-                return state
+                return v_in_add , weight * state['particle_mass'][p] , jnp.array([ix, iy, iz])
 
-            state = jax.lax.fori_loop(
-                0, 27 , inner_body, state
+
+            vmap_body = jax.vmap(
+                jax.vmap(
+                    jax.vmap(inner_body, in_axes=(None, None, 0, None)),
+                    in_axes=(None, 0, None,None)
+                ),
+                in_axes=(0, None, None,None)
             )
+
+            # grid_v_in ,grid_m = jnp.zeros_like(state['grid_v_in']), jnp.zeros_like(state['grid_m'])
+            v_in_add , m_in_add , idx = vmap_body(jnp.arange(3), jnp.arange(3), jnp.arange(3), state)
+
+            # construct 3x3x3 index without for loop
+
+            
+            # jax.debug.print("{v_in_add}", v_in_add=v_in_add.shape)
+            # ds = jax.lax.dynamic_slice(grid_v_in, (base_pos[0],base_pos[1],base_pos[2],0), (3,3,3,3))
+            # grid_v_in = jax.lax.dynamic_update_slice(grid_v_in, ds+v_in_add, (base_pos[0],base_pos[1],base_pos[2],0))
+
+
+            # ds2 = jax.lax.dynamic_slice(grid_m, (base_pos[0],base_pos[1],base_pos[2]), (3,3,3))
+            # grid_m = jax.lax.dynamic_update_slice(grid_m, ds2+m_in_add, (base_pos[0],base_pos[1],base_pos[2]))
+
+
+
+
+            # state['grid_v_in'] = state['grid_v_in'].at[base_pos[0], base_pos[1], base_pos[2], :].add(v_in_add)
             
             
-            return state
+            return v_in_add , m_in_add , idx 
 
         def compute_else(state):
-            return state
+            return jnp.zeros((3,3,3,3)), jnp.zeros((3,3,3)), jnp.zeros((3,3,3,3),dtype=jnp.int32)
+        
+        return jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,state)
 
-        state = jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else, state)
-        return state
-
-    state = jax.lax.fori_loop(0, state['particle_F'].shape[0], body, state)
+    vmap_body = jax.vmap(body, in_axes=(0, None))
+    g_v_in_acc , g_m_in_acc , idx_acc = vmap_body(jnp.arange(state['particle_F'].shape[0]), state)
+    state['grid_v_in'] = state['grid_v_in'].at[idx_acc[...,0],idx_acc[...,1],idx_acc[...,2],:].add(g_v_in_acc)
+    state['grid_m'] = state['grid_m'].at[idx_acc[...,0],idx_acc[...,1],idx_acc[...,2]].add(g_m_in_acc)
     return state
+        
 
+        
 
+    
+    
+    
+
+@jax.jit
 def grid_normalization_and_gravity(state, model, dt):
-    def body(index, state):
-        grid_x, grid_y, grid_z = jnp.unravel_index(index, state['grid_m'].shape)
-        def update_velocity(state):
-            v_out = state['grid_v_in'][grid_x, grid_y, grid_z] * (
-                1.0 / state['grid_m'][grid_x, grid_y, grid_z]
-            )
+    def update_velocity( grid_v_in, grid_m):
+        v_out = grid_v_in * (1.0 / grid_m)
+        v_out = v_out + dt * model['gravitational_acceleration']
+        return v_out
 
-            # jax.debug.print("{v_out}", v_out=state['grid_v_in'][grid_x, grid_y, grid_z])
-            v_out = v_out + dt * model['gravitational_acceleration']
-            state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(v_out)
-            return state
+    def no_update(grid_v_in,grid_m):
+        return grid_v_in
 
-        def no_update(state):
-            return state
-
-        state = jax.lax.cond(
-            state['grid_m'][grid_x, grid_y, grid_z] > 1e-15,
+    grid_shape = state['grid_m'].shape
+    grid_indices = jnp.arange(state['grid_m'].size).reshape(grid_shape)
+    
+    def body(grid_x, grid_y, grid_z):
+        cond = state['grid_m'][grid_x, grid_y, grid_z] > 1e-15
+        v_out = jax.lax.cond(
+            cond,
             update_velocity,
             no_update,
-            state
+            state['grid_v_in'][grid_x, grid_y, grid_z],
+            state['grid_m'][grid_x, grid_y, grid_z]
         )
+        return v_out
 
-        return state
+    vmapped_body = jax.vmap(
+        jax.vmap(
+            jax.vmap(body, in_axes=(None, None, 0)),
+            in_axes=(None, 0, None)
+        ),
+        in_axes=(0, None, None)
+    )
 
-    num_elements = state['grid_m'].size
-    jax.debug.print("{num_elements}", num_elements=num_elements)
-    state = jax.lax.fori_loop(0, num_elements, body, state)
+    state['grid_v_out'] =  vmapped_body(jnp.arange(grid_shape[0]), jnp.arange(grid_shape[1]), jnp.arange(grid_shape[2]))
+
     return state
 
 
-
+@jax.jit
 def update_cov(state, p, grad_v, dt):
     cov_n = jnp.array([
         [state['particle_cov'][p * 6], state['particle_cov'][p * 6 + 1], state['particle_cov'][p * 6 + 2]],
@@ -234,7 +278,7 @@ def update_cov(state, p, grad_v, dt):
     
     return state
 
-
+@jax.jit
 def g2p(state, model, dt):
     def body_fun(p, state):
 
@@ -257,46 +301,56 @@ def g2p(state, model, dt):
                 fx - 0.5
             ]).T
             
-            new_v = jnp.zeros(3)
-            new_C = jnp.zeros((3, 3))
-            new_F = jnp.zeros((3, 3))
             
-            for i in range(3):
-                for j in range(3):
-                    for k in range(3):
-                        ix = base_pos[0] + i
-                        iy = base_pos[1] + j
-                        iz = base_pos[2] + k
-                        dpos = jnp.array([i, j, k]) - fx
-                        weight = w[0, i] * w[1, j] * w[2, k]
-                        grid_v = state['grid_v_out'][ix, iy, iz]
-                        # jax.debug.print(" {ix} {iy} {iz} ", ix=ix, iy=iy, iz=iz)
+            def inner_body(i,j,k):
+                    
+                    ix = base_pos[0] + i
+                    iy = base_pos[1] + j
+                    iz = base_pos[2] + k
+                    dpos = jnp.array([i, j, k]) - fx
+                    weight = w[0, i] * w[1, j] * w[2, k]
+                    # print(ix)
+                    grid_v = state['grid_v_out'][ix, iy, iz]
+                    # jax.debug.print(" {ix} {iy} {iz} ", ix=ix, iy=iy, iz=iz)
 
-                        new_v = new_v + grid_v * weight
-                        new_C = new_C + jnp.outer(grid_v, dpos) * (weight * model['inv_dx'] * 4.0)
-                        dweight = compute_dweight(model, w, dw, i, j, k)
-                        new_F = new_F + jnp.outer(grid_v, dweight)
+                    
+                    dweight = compute_dweight(model, w, dw, i, j, k)
+
+                    return grid_v * weight, jnp.outer(grid_v, dpos) * (weight * model['inv_dx'] * 4.0),jnp.outer(grid_v, dweight)
+
             
-            state['particle_v'] = state['particle_v'].at[p].set(new_v)
+            vmap_inner_body = jax.vmap(
+                jax.vmap(
+                    jax.vmap(inner_body, in_axes=(0, None,None)),
+                    in_axes=(None, 0,None)
+                ),
+                in_axes=(None, None,0)
+            )
+            new_v, new_C, new_F =  vmap_inner_body(jnp.arange(3), jnp.arange(3), jnp.arange(3))
+            new_v , new_C , new_F = jnp.sum(new_v, axis=(0,1,2)), jnp.sum(new_C, axis=(0,1,2)), jnp.sum(new_F, axis=(0,1,2))
             new_x = state['particle_x'][p] + dt * new_v
-            state['particle_x'] = state['particle_x'].at[p].set(new_x)
-            state['particle_C'] = state['particle_C'].at[p].set(new_C)
-            
             I33 = jnp.eye(3)
             F_tmp = (I33 + new_F * dt) @ state['particle_F'][p]
-            state['particle_F_trial'] = state['particle_F_trial'].at[p].set(F_tmp)
+
+
             
-            state = jax.lax.cond(
-                model['update_cov_with_F'],
-                lambda state: update_cov(state, p, new_F, dt),
-                lambda state: state,
-                state
-            )
-            return state
-        state = jax.lax.cond(state['particle_selection'][p] == 0, lambda state: inside_fun(p,state), lambda state: state, state)
-        return state 
+            # state = jax.lax.cond(
+            #     model['update_cov_with_F'],
+            #     lambda state: update_cov(state, p, new_F, dt),
+            #     lambda state: state,
+            #     state
+            # )
+            return new_v, new_x, new_C, F_tmp
+        
+        def identity_fun(p,state):
+            return state['particle_v'][p], state['particle_x'][p], state['particle_C'][p], state['particle_F'][p]
+        
+        pv,px,pc,pf = jax.lax.cond(state['particle_selection'][p] == 0, lambda state: inside_fun(p,state), lambda state : identity_fun(p,state), state)
+        return pv,px,pc,pf 
     
-    state = jax.lax.fori_loop(0, state['particle_x'].shape[0], body_fun, state)
+    vmap_body = jax.vmap(body_fun, in_axes=(0, None))
+    state['particle_v'], state['particle_x'], state['particle_C'], state['particle_F'] = vmap_body(jnp.arange(state['particle_x'].shape[0]), state)
+    # state = jax.lax.fori_loop(0, state['particle_x'].shape[0], body_fun, state)
     return state
 
 

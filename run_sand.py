@@ -47,13 +47,13 @@ pos = [] # list of positions
     
 # save_data_at_frame(mpm_solver, directory_to_save, 0)
 # print(mpm_solver['mpm_model']['mu'], mpm_solver['mpm_model']['lam'])
-for k in range(1,200):
+for k in range(1,3):
     mpm_solver = p2g2p(mpm_solver,k,4e-3)
     np_x = mpm_solver['mpm_state']['particle_x'] / 1.0
     pos.append(np_x)
-    print( "Minimum y : " , jnp.min(mpm_solver['mpm_state']['particle_x'][:,1]),"| Maximum y : " , jnp.max(mpm_solver['mpm_state']['particle_x'][:,1]))
-
-    save_data_at_frame(mpm_solver, directory_to_save, k)
+    # print( "Minimum y : " , jnp.min(mpm_solver['mpm_state']['particle_x'][:,1]),"| Maximum y : " , jnp.max(mpm_solver['mpm_state']['particle_x'][:,1]))
+    print(np.array(np_x))
+    # save_data_at_frame(mpm_solver, directory_to_save, k)
 
 
 np.save('my_sand_collapse_4.npy', np.array(pos))
