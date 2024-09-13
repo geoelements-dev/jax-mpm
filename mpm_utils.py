@@ -3,6 +3,7 @@ import jax
 from jax import jit
 import os 
 import numpy as np
+jax.config.update("jax_enable_x64", True)
 
 from torch.utils import dlpack as torch_dlpack
 from jax import dlpack as jax_dlpack
@@ -37,7 +38,38 @@ def zero_grid(state):
     state['grid_v_in']=state['grid_v_in'].at[:,:,:,:].set(0)
     state['grid_v_out']=state['grid_v_out'].at[:,:,:,:].set(0)
     return state
+
+@jax.jit
+def kirchoff_stress_water(J, bulk):
+    gamma = 1.1 
+
+
+    # clip J between 0.9 and 1.1 
+    J = jnp.clip(J, 0.9, 1.1)
+    pressure = -bulk * (jnp.power(J, -gamma) - 1.0)
+    # jax.debug.print("pressure = {pressure}", pressure=pressure)
+    # jax.debug.print("J = {J}", J=J)
+
+    # jax.debug.print("pressure = {pressure}", pressure=pressure)
+    identity_matrix = jnp.eye(3)  # 3x3 identity matrix
+    cauchy_stress = identity_matrix * pressure
+    return J * cauchy_stress
+
+@jax.jit
+def kirchoff_stress_neoHookean(F, U, V, J, sig, mu, lam):
+    b = jnp.array([sig[0] * sig[0], sig[1] * sig[1], sig[2] * sig[2]])
+    b_mean = jnp.mean(b)
+    b_hat = b - b_mean
+
+    tau = mu * J ** (-2.0 / 3.0) * b_hat + (lam / 2.0) * (J * J - 1.0) * jnp.ones(3)
     
+    tau_diag = jnp.diag(tau)  # Diagonal matrix with tau values
+    stress = U @ tau_diag @ V.T @ F.T
+    
+    return stress
+    
+
+
 @jax.jit
 def compute_R_from_F(mpm_state):
     def body_fun(p, state):
@@ -128,14 +160,14 @@ def compute_stress_from_F_trial(state, model, dt):
         F_trial = state['particle_F_trial'][p]
 
         def compute_if_selected_0(state):
-
-            F = sand_return_mapping(F_trial, state, model, p)
+            F = F_trial
+            # F = sand_return_mapping(F_trial, state, model, p)
             # jax.debug.print("{v_in_add}", v_in_add=F)
 
             J = jnp.linalg.det(F)
             U, sig, V = svd3(F)
-            stress = kirchoff_stress_drucker_prager(F, U, V, sig, model['mu'][p], model['lam'][p])
-
+            # stress = kirchoff_stress_drucker_prager(F, U, V, sig, model['mu'][p], model['lam'][p])
+            stress = kirchoff_stress_water(J, model['bulk'][p])
             stress = (stress + stress.T) / 2.0  
             # state['particle_F'] = state['particle_F'].at[p].set(F)
             # state['particle_stress'] = state['particle_stress'].at[p].set(stress)
@@ -150,6 +182,7 @@ def compute_stress_from_F_trial(state, model, dt):
     vmap_body = jax.vmap(body, in_axes=(0, None))
     state['particle_F'], state['particle_stress'] = vmap_body(jnp.arange(state['particle_F'].shape[0]), state)
     return state
+
 
 @jax.jit
 def compute_dweight(model, w, dw, i, j, k):
@@ -260,9 +293,20 @@ def p2g_apic_with_stress(state, model, dt):
     def body(p, state):
         def compute_if_selected_0(state):
             stress = state['particle_stress'][p]
-            grid_pos = state['particle_x'][p] * model['inv_dx']
-            base_pos = (grid_pos - 0.5).astype(jnp.int32)
-            fx = grid_pos - base_pos.astype(jnp.float32)
+            grid_pos = jnp.clip(state['particle_x'][p] * model['inv_dx'], 0.0, model['n_grid'] - 2)
+
+            # def print_debug(grid_pos):
+            #     jax.debug.print("ERRROR!!! grid_pos: {grid_pos} , n_grid: {n_grid} , grid_bool: {grid_bool}", grid_pos=grid_pos, n_grid=model['n_grid'],grid_bool=grid_pos+2>=model['n_grid'])
+            #     return None
+            # def do_nothing(grid_pos):
+            #     return None
+            # jax.lax.cond(jnp.any(grid_pos+2>=model['n_grid']),print_debug,do_nothing,grid_pos)
+
+
+            base_pos = (grid_pos - 0.5).astype(jnp.int64)
+
+            
+            fx = grid_pos - base_pos.astype(jnp.float64)
             wa = 1.5 - fx
             wb = fx - 1.0
             wc = fx - 0.5
@@ -334,7 +378,7 @@ def p2g_apic_with_stress(state, model, dt):
             return v_in_add , m_in_add , idx 
 
         def compute_else(state):
-            return jnp.zeros((3,3,3,3)), jnp.zeros((3,3,3)), jnp.zeros((3,3,3,3),dtype=jnp.int32)
+            return jnp.zeros((3,3,3,3)), jnp.zeros((3,3,3)), jnp.zeros((3,3,3,3),dtype=jnp.int64)
         
         return jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,state)
 
@@ -349,9 +393,9 @@ def g2p(state, model, dt):
     def body_fun(p, state):
 
         def inside_fun(p,state):
-            grid_pos = state['particle_x'][p] * model['inv_dx']
-            base_pos = (grid_pos - 0.5).astype(jnp.int32)
-            fx = grid_pos - (base_pos).astype(jnp.float32)
+            grid_pos = jnp.clip(state['particle_x'][p] * model['inv_dx'], 0.0, model['n_grid'] - 2)
+            base_pos = (grid_pos - 0.5).astype(jnp.int64) # Check the truncating , floor ? 
+            fx = grid_pos - (base_pos).astype(jnp.float64)
             wa = 1.5 - fx
             wb = fx - 1.0
             wc = fx - 0.5
@@ -376,7 +420,7 @@ def g2p(state, model, dt):
                     dpos = jnp.array([i, j, k]) - fx
                     weight = w[0, i] * w[1, j] * w[2, k]
                     # print(ix)
-                    grid_v = state['grid_v_out'][ix, iy, iz]
+                    grid_v = state['grid_v_out'].at[ix, iy, iz].get(mode='fill', fill_value=0)
                     # jax.debug.print(" {ix} {iy} {iz} ", ix=i, iy=j, iz=k)
 
                     
@@ -394,10 +438,13 @@ def g2p(state, model, dt):
             )
             new_v, new_C, new_F =  vmap_inner_body(jnp.arange(3), jnp.arange(3), jnp.arange(3))
             new_v , new_C , new_F = jnp.sum(new_v, axis=(0,1,2)), jnp.sum(new_C, axis=(0,1,2)), jnp.sum(new_F, axis=(0,1,2))
+            # jax.debug.print("new_F: {x}", x=new_F)
+            # jax.debug.print("new_C: {x}", x=new_C)
             new_x = state['particle_x'][p] + dt * new_v
             I33 = jnp.eye(3)
-            F_tmp = (I33 + new_F * dt) @ state['particle_F'][p]
+            F_tmp = jnp.matmul((I33 + new_F * dt) , state['particle_F'][p],precision=jax.lax.Precision.HIGHEST)
 
+            # jax.debug.print("F_tmp: {x}", x=F_tmp)
 
             
             # state = jax.lax.cond(

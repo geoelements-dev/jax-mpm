@@ -3,136 +3,132 @@ import jax.numpy as jnp
 import numpy as np
 import h5py
 import os 
-from mpm_utils_f import * 
+from mpm_utils import * 
 import time 
+jax.config.update("jax_enable_x64", True)
 
-def initialize(n_particles, n_grid=100, grid_lim=1.0,dim=3):
+def initialize(n_particles, n_grid=100, grid_lim=1.0, dim=3):
     dx = grid_lim / n_grid
     inv_dx = float(n_grid / grid_lim)
     sin_phi = jnp.sin(25.0 / 180.0 * jnp.pi)  # 25 is friction angle (hard coded for now)
+    
     mpm_simulator = {
-    'n_particles': n_particles,
-    'mpm_model':{
-        'grid_lim': grid_lim,
-        'n_grid': n_grid,
-        'grid_dim_x': n_grid,
-        'grid_dim_y': n_grid,
-        'grid_dim_z': n_grid,
-        'dx': dx,
-        'inv_dx': inv_dx,
-        'E': jnp.zeros(n_particles),
-        'nu': jnp.zeros(n_particles),
-        'mu': jnp.zeros(n_particles),
-        'lam': jnp.zeros(n_particles),
-        'update_cov_with_F': False,
-        'material': 0,
-        'plastic_viscosity': 0.0,
-        'softening': 0.1,
-        'yield_stress': jnp.zeros(n_particles),
-        'friction_angle': 25.0,
-        
-        'gravitational_acceleration': jnp.array([0.0, 0.0, 0.0]),
-        'rpic_damping': 0.0,
-        'grid_v_damping_scale': 1.1,
-        'alpha': jnp.sqrt(2.0 / 3.0) * 2.0 * sin_phi / (3.0 - sin_phi)
-    },
-
-    'mpm_state' :{
-        'particle_x': jnp.empty((n_particles, 3)),
-        'particle_v': jnp.zeros((n_particles, 3)),
-        'particle_F': jnp.zeros((n_particles, 3, 3)),
-        'particle_R': jnp.zeros((n_particles, 3, 3)),
-        'particle_init_cov': jnp.zeros(n_particles * 6),
-        'particle_cov': jnp.zeros(n_particles * 6),
-        'particle_F_trial': jnp.zeros((n_particles, 3, 3)),
-        'particle_stress': jnp.zeros((n_particles, 3, 3)),
-        'particle_vol': jnp.empty(n_particles),
-        'particle_mass': jnp.zeros(n_particles),
-        'particle_density': jnp.zeros(n_particles),
-        'particle_C': jnp.zeros((n_particles, 3, 3)),
-        'particle_Jp': jnp.zeros(n_particles),
-        'particle_selection': jnp.zeros(n_particles, dtype=int),
-        'grid_m': jnp.zeros((n_grid, n_grid, n_grid)),
-        'grid_v_in': jnp.zeros((n_grid, n_grid, n_grid, 3)),
-        'grid_v_out': jnp.zeros((n_grid, n_grid, n_grid, 3))
-    },
-    'time': 0.0,
-    'tailored_struct_for_bc':{
-        "point": jnp.zeros(3),
-        "normal": jnp.zeros(3),
-        "start_time": 0.0,
-        "end_time": 0.0,
-        "friction": 0.0,
-        "surface_type": 0,
-        "velocity": jnp.zeros(3),
-        "threshold": 0.0,
-        "reset": 0,
-        "point_rotate": jnp.zeros(3),
-        "normal_rotate": jnp.zeros(3),
-        "x_unit": jnp.zeros(3),
-        "y_unit": jnp.zeros(3),
-        "radius": 0.0,
-        "v_scale": 0.0,
-        "width": 0.0,
-        "point_plane": jnp.zeros(3),
-        "normal_plane": jnp.zeros(3),
-        "velocity_plane": jnp.zeros(3),
-        "threshold_plane": 0.0
-    },
-    "grid_postprocess": [],
-    "collider_params": [],
-    "modify_bc": [],
-    "pre_p2g_operations": [],
-    "impulse_params": [],
-    "particle_velocity_modifiers": [],
-    "particle_velocity_modifier_params": [],
-    "dim":dim
-
-
+        'n_particles': n_particles,
+        'mpm_model': {
+            'grid_lim': grid_lim,
+            'n_grid': n_grid,
+            'grid_dim_x': n_grid,
+            'grid_dim_y': n_grid,
+            'grid_dim_z': n_grid,
+            'dx': dx,
+            'inv_dx': inv_dx,
+            'E': jnp.zeros(n_particles, dtype=jnp.float64),
+            'nu': jnp.zeros(n_particles, dtype=jnp.float64),
+            'mu': jnp.zeros(n_particles, dtype=jnp.float64),
+            'lam': jnp.zeros(n_particles, dtype=jnp.float64),
+            'update_cov_with_F': False,
+            'material': 0,
+            'plastic_viscosity': jnp.float64(0.0),
+            'softening': jnp.float64(0.1),
+            'yield_stress': jnp.zeros(n_particles, dtype=jnp.float64),
+            'friction_angle': jnp.float64(25.0),
+            'bulk': jnp.zeros(n_particles, dtype=jnp.float64),
+            'gravitational_acceleration': jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
+            'rpic_damping': jnp.float64(0.0),
+            'grid_v_damping_scale': jnp.float64(1.1),
+            'alpha': jnp.sqrt(2.0 / 3.0) * 2.0 * sin_phi / (3.0 - sin_phi)
+        },
+        'mpm_state': {
+            'particle_x': jnp.empty((n_particles, 3), dtype=jnp.float64),
+            'particle_v': jnp.zeros((n_particles, 3), dtype=jnp.float64),
+            'particle_F': jnp.zeros((n_particles, 3, 3), dtype=jnp.float64),
+            'particle_R': jnp.zeros((n_particles, 3, 3), dtype=jnp.float64),
+            'particle_init_cov': jnp.zeros(n_particles * 6, dtype=jnp.float64),
+            'particle_cov': jnp.zeros(n_particles * 6, dtype=jnp.float64),
+            'particle_F_trial': jnp.zeros((n_particles, 3, 3), dtype=jnp.float64),
+            'particle_stress': jnp.zeros((n_particles, 3, 3), dtype=jnp.float64),
+            'particle_vol': jnp.empty(n_particles, dtype=jnp.float64),
+            'particle_mass': jnp.zeros(n_particles, dtype=jnp.float64),
+            'particle_density': jnp.zeros(n_particles, dtype=jnp.float64),
+            'particle_C': jnp.zeros((n_particles, 3, 3), dtype=jnp.float64),
+            'particle_Jp': jnp.zeros(n_particles, dtype=jnp.float64),
+            'particle_selection': jnp.zeros(n_particles, dtype=jnp.int64),
+            'grid_m': jnp.zeros((n_grid, n_grid, n_grid), dtype=jnp.float64),
+            'grid_v_in': jnp.zeros((n_grid, n_grid, n_grid, 3), dtype=jnp.float64),
+            'grid_v_out': jnp.zeros((n_grid, n_grid, n_grid, 3), dtype=jnp.float64)
+        },
+        'time': jnp.float64(0.0),
+        'tailored_struct_for_bc': {
+            "point": jnp.zeros(3, dtype=jnp.float64),
+            "normal": jnp.zeros(3, dtype=jnp.float64),
+            "start_time": jnp.float64(0.0),
+            "end_time": jnp.float64(0.0),
+            "friction": jnp.float64(0.0),
+            "surface_type": jnp.int64(0),
+            "velocity": jnp.zeros(3, dtype=jnp.float64),
+            "threshold": jnp.float64(0.0),
+            "reset": jnp.int64(0),
+            "point_rotate": jnp.zeros(3, dtype=jnp.float64),
+            "normal_rotate": jnp.zeros(3, dtype=jnp.float64),
+            "x_unit": jnp.zeros(3, dtype=jnp.float64),
+            "y_unit": jnp.zeros(3, dtype=jnp.float64),
+            "radius": jnp.float64(0.0),
+            "v_scale": jnp.float64(0.0),
+            "width": jnp.float64(0.0),
+            "point_plane": jnp.zeros(3, dtype=jnp.float64),
+            "normal_plane": jnp.zeros(3, dtype=jnp.float64),
+            "velocity_plane": jnp.zeros(3, dtype=jnp.float64),
+            "threshold_plane": jnp.float64(0.0)
+        },
+        "grid_postprocess": [],
+        "collider_params": [],
+        "modify_bc": [],
+        "pre_p2g_operations": [],
+        "impulse_params": [],
+        "particle_velocity_modifiers": [],
+        "particle_velocity_modifier_params": [],
+        "dim": dim
     }
 
-
-    return mpm_simulator 
-
-
-def add_cube(mpm_sim, lower_corner, cube_size, sample_density=None, velocity=None):
+    return mpm_simulator
+def add_cube(lower_corner, cube_size, n_grid=64, grid_lim=1, sample_density=None, velocity=None):
     if sample_density is None:
-        sample_density = 2 ** mpm_sim['dim']
+        sample_density = 2 ** 3
 
     lower_corner = jnp.array(lower_corner)
     cube_size = jnp.array(cube_size)
     vol = jnp.prod(cube_size)
-    num_new_particles = int(sample_density * vol / mpm_sim['mpm_model']['dx'] ** mpm_sim['dim'] + 1)
-    # print(num_new_particles)
-    source_bound = jnp.array([lower_corner,cube_size])
-    # jax.debug.print('{source_bound}', source_bound=source_bound)
+    num_new_particles = int(sample_density * vol / (grid_lim / n_grid) ** 3 + 1)
+    
+    source_bound = jnp.array([lower_corner, cube_size])
     if velocity is None:
         velocity = jnp.zeros(3)
     else:
         velocity = jnp.array(velocity)
 
-    # Create new particles and update the simulation state
-    mpm_sim = initialize( num_new_particles ,mpm_sim['mpm_model']['n_grid'], mpm_sim['mpm_model']['grid_lim'], mpm_sim['dim'])
-    new_particles = jnp.arange(0,num_new_particles)
-    particle_x = mpm_sim['mpm_state']['particle_x']
-    particle_v = mpm_sim['mpm_state']['particle_v']
-    volume = mpm_sim['mpm_model']['dx'] ** mpm_sim['dim']
-    # volume = 2.5e-8
-        
-        
-    key = jax.random.PRNGKey(1)
-    for i in new_particles:
-        x = jnp.zeros(3)
-        for k in range(mpm_sim['dim']):
-            key, subkey = jax.random.split(key)
-            x = x.at[k].set(source_bound[0, k] + (jax.random.uniform(subkey)) * (source_bound[1, k]))
-        particle_x = particle_x.at[i].set(x)
-        particle_v = particle_v.at[i].set(velocity)
+    print("Number of particles: ", num_new_particles)
+    # Initialize the simulation state
+    mpm_sim = initialize(num_new_particles, n_grid, grid_lim)
+    
+    # Function to generate a single particle's position
+    def generate_position(subkey):
+        random_vals = jax.random.uniform(subkey, shape=(3,))
+        return source_bound[0] + random_vals * source_bound[1]
 
+    # Generate random keys for each new particle
+    key = jax.random.PRNGKey(1)
+    subkeys = jax.random.split(key, num_new_particles)
+
+    # Vectorize the position generation
+    particle_x = jax.vmap(generate_position)(subkeys)
+    particle_v = jnp.tile(velocity, (num_new_particles, 1))
+
+    # Set particle properties in the simulation state
+    volume = (grid_lim / n_grid) ** 3
     mpm_sim['mpm_state']['particle_x'] = particle_x
     mpm_sim['mpm_state']['particle_v'] = particle_v
     mpm_sim['mpm_state']['particle_vol'] = jnp.ones(num_new_particles) * volume
-    mpm_sim['mpm_state']['particle_F_trial'] = jnp.array([jnp.eye(3) for _ in range(num_new_particles)])
+    mpm_sim['mpm_state']['particle_F_trial'] = jax.vmap(lambda _: jnp.eye(3))(jnp.arange(num_new_particles))
 
     return mpm_sim
 
@@ -184,7 +180,8 @@ def set_parameters_dict(mpm_model, mpm_state, kwargs={}):
         "sand": 2,
         "foam": 3,
         "snow": 4,
-        "plasticine": 5
+        "plasticine": 5,
+        "fluid": 6
     }
 
     material = kwargs.get("material")
@@ -241,6 +238,9 @@ def set_parameters_dict(mpm_model, mpm_state, kwargs={}):
         mpm_model['softening'] = kwargs["softening"]
     if "grid_v_damping_scale" in kwargs:
         mpm_model['grid_v_damping_scale'] = kwargs["grid_v_damping_scale"]
+    
+    if "bulk_modulus" in kwargs:
+        mpm_model['bulk'] = mpm_model['bulk'].at[:].set(kwargs["bulk_modulus"])
 
     return mpm_model, mpm_state
 
@@ -260,7 +260,6 @@ def add_grid_boundaries(mpm_sim,padding = 3):
     # def preprocess_x(time, dt, state, model, impulse_params):
     #     state['particle_x'] = state['particle_x'] + model['dx']*impulse_params['padding']
     #     return state
-    
     @jax.jit
     def bound_grid(time, dt, state, model, collider):
         def body(grid_x, grid_y, grid_z , state):
@@ -294,7 +293,7 @@ def add_grid_boundaries(mpm_sim,padding = 3):
             )
            
 
-            return jnp.array([v0, v1, v2]),jnp.array([grid_x, grid_y, grid_z])
+            return jnp.array([v0, v1, v2])
     
         vmap_body = jax.vmap(
             jax.vmap(
@@ -303,8 +302,7 @@ def add_grid_boundaries(mpm_sim,padding = 3):
             in_axes=(None, None, 0, None)
         )
         # state['particle_x'] = state['particle_x'] - model['dx']*collider['padding']
-        g_v , idx_acc = vmap_body(jnp.arange(state['grid_v_out'].shape[0]), jnp.arange(state['grid_v_out'].shape[1]), jnp.arange(state['grid_v_out'].shape[2]), state)
-        state['grid_v_out'] = state['grid_v_out'].at[idx_acc[...,0],idx_acc[...,1],idx_acc[...,2],:].set(g_v)
+        state['grid_v_out'] = vmap_body(jnp.arange(state['grid_v_out'].shape[0]), jnp.arange(state['grid_v_out'].shape[1]), jnp.arange(state['grid_v_out'].shape[2]), state)
         return state
 
     mpm_sim['grid_postprocess'].append(bound_grid)
@@ -361,14 +359,12 @@ def add_surface_collider(mpm_sim,point,
                 normal_component = jnp.dot(v, n)
                 
                 def project_out_normal(v, n):
-                    jax.debug.print('normal component')
                     return v - normal_component * n
                 
                 def project_out_inward_normal(v, n):
                     return v - jnp.minimum(normal_component, 0.0) * n
                 
                 def apply_friction(v):
-                    jax.debug.print('friction')
                     return jnp.maximum(0.0, jnp.linalg.norm(v) + normal_component * collider['friction']) * (v / jnp.linalg.norm(v))
                 
                 v = jax.lax.cond(
