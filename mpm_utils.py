@@ -33,6 +33,14 @@ def log_array(filename, array_name, array, step, comments=""):
         f.write("\n\n")
 
 @jax.jit
+def set_bulk(mpm_model):
+    lam = mpm_model['lam']
+    mu = mpm_model['mu']
+    mpm_model['bulk'] = lam + 2./3. * mu
+    return mpm_model
+
+
+@jax.jit
 def zero_grid(state):
     state['grid_m']=state['grid_m'].at[:,:,:].set(0)
     state['grid_v_in']=state['grid_v_in'].at[:,:,:,:].set(0)
@@ -41,11 +49,11 @@ def zero_grid(state):
 
 @jax.jit
 def kirchoff_stress_water(J, bulk):
-    gamma = 1.1 
+    gamma = 1.1
 
 
     # clip J between 0.9 and 1.1 
-    J = jnp.clip(J, 0.9, 1.1)
+    J = jnp.clip(J, 0.9, 1.5)
     pressure = -bulk * (jnp.power(J, -gamma) - 1.0)
     # jax.debug.print("pressure = {pressure}", pressure=pressure)
     # jax.debug.print("J = {J}", J=J)
@@ -160,17 +168,24 @@ def compute_stress_from_F_trial(state, model, dt):
         F_trial = state['particle_F_trial'][p]
 
         def compute_if_selected_0(state):
-            F = F_trial
-            # F = sand_return_mapping(F_trial, state, model, p)
+            F = jax.lax.cond(
+                model['material']==2,
+                lambda x: sand_return_mapping(x, state, model, p),
+                lambda x: x,
+                F_trial
+            )
             # jax.debug.print("{v_in_add}", v_in_add=F)
 
             J = jnp.linalg.det(F)
             U, sig, V = svd3(F)
-            # stress = kirchoff_stress_drucker_prager(F, U, V, sig, model['mu'][p], model['lam'][p])
-            stress = kirchoff_stress_water(J, model['bulk'][p])
+            stress = jax.lax.cond(
+                model['material']==2,
+                lambda : kirchoff_stress_drucker_prager(F, U, V, sig, model['mu'][p], model['lam'][p]),
+                lambda : kirchoff_stress_water(J, model['bulk'][p]))
+
+
             stress = (stress + stress.T) / 2.0  
-            # state['particle_F'] = state['particle_F'].at[p].set(F)
-            # state['particle_stress'] = state['particle_stress'].at[p].set(stress)
+            
             return F,stress
         
         def compute_else(state):
@@ -181,6 +196,8 @@ def compute_stress_from_F_trial(state, model, dt):
 
     vmap_body = jax.vmap(body, in_axes=(0, None))
     state['particle_F'], state['particle_stress'] = vmap_body(jnp.arange(state['particle_F'].shape[0]), state)
+    # jax.debug.print("max_F : {max_F}", max_F=jnp.max(state['particle_F']))
+    # jax.debug.print("max_stress : {max_stress}", max_stress=jnp.max(state['particle_stress']))
     return state
 
 
@@ -412,32 +429,26 @@ def g2p(state, model, dt):
             ]).T
             
             
-            def inner_body(i,j,k):
-                    
-                    ix = base_pos[0] + i
-                    iy = base_pos[1] + j
-                    iz = base_pos[2] + k
-                    dpos = jnp.array([i, j, k]) - fx
-                    weight = w[0, i] * w[1, j] * w[2, k]
-                    # print(ix)
-                    grid_v = state['grid_v_out'].at[ix, iy, iz].get(mode='fill', fill_value=0)
-                    # jax.debug.print(" {ix} {iy} {iz} ", ix=i, iy=j, iz=k)
-
-                    
-                    dweight = compute_dweight(model, w, dw, i, j, k)
-
-                    return grid_v * weight, jnp.outer(grid_v, dpos) * (weight * model['inv_dx'] * 4.0),jnp.outer(grid_v, dweight)
-
+            new_v = jnp.zeros(3)
+            new_C = jnp.zeros((3, 3))
+            new_F = jnp.zeros((3, 3))
             
-            vmap_inner_body = jax.vmap(
-                jax.vmap(
-                    jax.vmap(inner_body, in_axes=(0, None,None)),
-                    in_axes=(None, 0,None)
-                ),
-                in_axes=(None, None,0)
-            )
-            new_v, new_C, new_F =  vmap_inner_body(jnp.arange(3), jnp.arange(3), jnp.arange(3))
-            new_v , new_C , new_F = jnp.sum(new_v, axis=(0,1,2)), jnp.sum(new_C, axis=(0,1,2)), jnp.sum(new_F, axis=(0,1,2))
+            for i in range(3):
+                for j in range(3):
+                    for k in range(3):
+                        ix = base_pos[0] + i
+                        iy = base_pos[1] + j
+                        iz = base_pos[2] + k
+                        dpos = jnp.array([i, j, k]) - fx
+                        weight = w[0, i] * w[1, j] * w[2, k]
+                        grid_v = state['grid_v_out'][ix, iy, iz]
+                        # jax.debug.print(" {ix} {iy} {iz} ", ix=ix, iy=iy, iz=iz)
+
+                        new_v = new_v + grid_v * weight
+                        new_C = new_C + jnp.outer(grid_v, dpos) * (weight * model['inv_dx'] * 4.0)
+                        dweight = compute_dweight(model, w, dw, i, j, k)
+                        new_F = new_F + jnp.outer(grid_v, dweight)
+            
             # jax.debug.print("new_F: {x}", x=new_F)
             # jax.debug.print("new_C: {x}", x=new_C)
             new_x = state['particle_x'][p] + dt * new_v

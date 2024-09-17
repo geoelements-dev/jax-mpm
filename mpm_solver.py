@@ -227,6 +227,8 @@ def set_parameters_dict(mpm_model, mpm_state, kwargs={}):
         density_value = kwargs["density"]
         mpm_state['particle_density'] = mpm_state['particle_density'].at[:].set(density_value)
         mpm_state['particle_mass'] = mpm_state['particle_density'] * mpm_state['particle_vol']
+        print("Density set to: ", density_value)
+        print("Particle mass set to: ", mpm_state['particle_mass'][0])
         
 
 
@@ -271,18 +273,14 @@ def add_grid_boundaries(mpm_sim,padding = 3):
                 lambda s: s[grid_x, grid_y, grid_z, 0],
                 state['grid_v_out']
             )
-            
-            
 
             # Apply boundary conditions on y-axis
-            v1=jax.lax.cond(
+            v1 = jax.lax.cond(
                 ((grid_y < collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][1] < 0)) | ((grid_y >= state['grid_m'].shape[1] - collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][1] > 0)),
                 lambda s: 0.0,
                 lambda s: s[grid_x, grid_y, grid_z, 1],
                 state['grid_v_out']
             )
-            
-            
 
             # Apply boundary conditions on z-axis
             v2 = jax.lax.cond(
@@ -291,24 +289,170 @@ def add_grid_boundaries(mpm_sim,padding = 3):
                 lambda s: s[grid_x, grid_y, grid_z, 2],
                 state['grid_v_out']
             )
-           
 
-            return jnp.array([v0, v1, v2])
-    
+            return jnp.array([v0, v1, v2]) , jnp.array([grid_x, grid_y, grid_z])
+
         vmap_body = jax.vmap(
             jax.vmap(
-                jax.vmap(body, in_axes=(0, None, None, None)) , in_axes=(None, 0, None, None)
+                jax.vmap(body, in_axes=(None, None, 0, None)), in_axes=(None, 0, None, None)
             ),
-            in_axes=(None, None, 0, None)
+            in_axes=(0, None, None, None)
         )
-        # state['particle_x'] = state['particle_x'] - model['dx']*collider['padding']
-        state['grid_v_out'] = vmap_body(jnp.arange(state['grid_v_out'].shape[0]), jnp.arange(state['grid_v_out'].shape[1]), jnp.arange(state['grid_v_out'].shape[2]), state)
+
+        g_v , idx_in_acc = vmap_body(jnp.arange(state['grid_v_out'].shape[0]), jnp.arange(state['grid_v_out'].shape[1]), jnp.arange(state['grid_v_out'].shape[2]), state)
+        state['grid_v_out'] = state['grid_v_out'].at[idx_in_acc[...,0],idx_in_acc[...,1],idx_in_acc[...,2],:].set(g_v)
         return state
+
 
     mpm_sim['grid_postprocess'].append(bound_grid)
     # mpm_sim['pre_p2g_operations'].append(preprocess_x)
     mpm_sim['modify_bc'].append(None)
     return mpm_sim
+
+
+@jax.jit
+def bound_grid(time, dt, state, model, collider):
+    def body(grid_x, grid_y, grid_z , state):
+        
+        # Apply boundary conditions on x-axis
+        v0 = jax.lax.cond(
+            ((grid_x < collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][0] < 0)) | ((grid_x >= state['grid_m'].shape[0] - collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][0] > 0)),
+            lambda s: 0.0,
+            lambda s: s[grid_x, grid_y, grid_z, 0],
+            state['grid_v_out']
+        )
+
+        # Apply boundary conditions on y-axis
+        v1 = jax.lax.cond(
+            ((grid_y < collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][1] < 0)) | ((grid_y >= state['grid_m'].shape[1] - collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][1] > 0)),
+            lambda s: 0.0,
+            lambda s: s[grid_x, grid_y, grid_z, 1],
+            state['grid_v_out']
+        )
+
+        # Apply boundary conditions on z-axis
+        v2 = jax.lax.cond(
+            ((grid_z < collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][2] < 0)) | ((grid_z >= state['grid_m'].shape[2] - collider['padding']) & (state['grid_v_out'][grid_x, grid_y, grid_z][2] > 0)),
+            lambda s: 0.0,
+            lambda s: s[grid_x, grid_y, grid_z, 2],
+            state['grid_v_out']
+        )
+
+        return jnp.array([v0, v1, v2]) , jnp.array([grid_x, grid_y, grid_z])
+
+    vmap_body = jax.vmap(
+        jax.vmap(
+            jax.vmap(body, in_axes=(None, None, 0, None)), in_axes=(None, 0, None, None)
+        ),
+        in_axes=(0, None, None, None)
+    )
+
+    g_v , idx_in_acc = vmap_body(jnp.arange(state['grid_v_out'].shape[0]), jnp.arange(state['grid_v_out'].shape[1]), jnp.arange(state['grid_v_out'].shape[2]), state)
+    state['grid_v_out'] = state['grid_v_out'].at[idx_in_acc[...,0],idx_in_acc[...,1],idx_in_acc[...,2],:].set(g_v)
+    return state
+
+
+@jax.jit
+def collide(time, dt, state, model, collider):
+    grid_shape = state['grid_v_out'].shape[:3]
+
+    def update_velocity(grid_x,grid_y,grid_z, state, model, collider, time):
+        offset = jnp.array([
+            grid_x * model['dx'] - collider['point'][0],
+            grid_y * model['dx'] - collider['point'][1],
+            grid_z * model['dx'] - collider['point'][2]
+        ])
+        n = collider['normal']
+        dotproduct = jnp.dot(offset, n)
+        # jax.debug.print('{dotproduct}', dotproduct=dotproduct)
+
+        def set_zero_velocity(state):
+            # state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(jnp.zeros(3))
+            # jax.debug.print('zero vel')
+
+            return jnp.zeros(3) 
+        
+        def handle_surface_type(state, v):
+            normal_component = jnp.dot(v, n)
+            
+            def project_out_normal(v, n):
+                return v - normal_component * n
+            
+            def project_out_inward_normal(v, n):
+                return v - jnp.minimum(normal_component, 0.0) * n
+            
+            def apply_friction(v):
+                return jnp.maximum(0.0, jnp.linalg.norm(v) + normal_component * collider['friction']) * (v / jnp.linalg.norm(v))
+            
+            v = jax.lax.cond(
+                collider['surface_type'] == 1,
+                lambda v: project_out_normal(v, n),
+                lambda v: project_out_inward_normal(v, n),
+                v
+            )
+            v = jax.lax.cond(
+                (normal_component < 0.0) & (jnp.linalg.norm(v) > 1e-30),
+                lambda v: apply_friction(v),
+                lambda v: v,
+                v
+            )
+            
+            # state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(v) 
+            return v
+        
+
+        def type_11_condition(state):
+            v_in = state['grid_v_out'][grid_x, grid_y, grid_z]
+            # state['grid_v_out'] = state['grid_v_out'].at[grid_x, grid_y, grid_z].set(jnp.array([v_in[0], 0.0, v_in[2]]) * 0.3)
+            return jnp.array([v_in[0], 0.0, v_in[2]]) * 0.3
+        
+        def inner_condition():
+            return jax.lax.cond(
+                collider['surface_type'] == 0,
+                lambda state: set_zero_velocity(state),
+                lambda state: jax.lax.cond(
+                    collider['surface_type'] == 11,
+                    lambda state: jax.lax.cond(
+                        (grid_z * model['dx'] < 0.4) | (grid_z * model['dx'] > 0.53),
+                        lambda state: set_zero_velocity(state),
+                        lambda state: type_11_condition(state),
+                        state
+                    ),
+                    lambda state: handle_surface_type(state, state['grid_v_out'][grid_x, grid_y, grid_z]),
+                    state
+                ),
+                state
+
+            )
+
+        return jax.lax.cond(dotproduct < 0.0, inner_condition, lambda: state['grid_v_out'][grid_x, grid_y, grid_z]) , jnp.array([grid_x, grid_y, grid_z])
+
+    # grid_x, grid_y, grid_z = jnp.indices(grid_shape)
+    vmapped_update_velocity = jax.vmap(
+        jax.vmap(
+            jax.vmap(update_velocity, in_axes=(None, None, 0, None, None, None, None)),
+            in_axes=(None, 0, None, None, None, None, None)
+        ),
+        in_axes=(0, None, None, None, None, None, None)
+    )
+    
+    def inside_time(state):
+        g_v , idx_in_acc = vmapped_update_velocity(jnp.arange(grid_shape[0]), jnp.arange(grid_shape[1]), jnp.arange(grid_shape[2]), state, model, collider, time)
+        state['grid_v_out'] = state['grid_v_out'].at[idx_in_acc[...,0],idx_in_acc[...,1],idx_in_acc[...,2],:].set(g_v)
+        return state['grid_v_out']
+    
+
+    def outer_condition(state):
+        return jax.lax.cond(
+            (time >= collider['start_time']) & (time < collider['end_time']),
+            inside_time,
+            lambda state: state['grid_v_out'],
+            state
+        )
+
+    state['grid_v_out'] = outer_condition(state)
+    return state
+
 
 def add_surface_collider(mpm_sim,point,
         normal,
@@ -408,7 +552,7 @@ def add_surface_collider(mpm_sim,point,
 
                 )
 
-            return jax.lax.cond(dotproduct < 0.0, inner_condition, lambda: state['grid_v_out'][grid_x, grid_y, grid_z])
+            return jax.lax.cond(dotproduct < 0.0, inner_condition, lambda: state['grid_v_out'][grid_x, grid_y, grid_z]) , jnp.array([grid_x, grid_y, grid_z])
 
         # grid_x, grid_y, grid_z = jnp.indices(grid_shape)
         vmapped_update_velocity = jax.vmap(
@@ -419,10 +563,16 @@ def add_surface_collider(mpm_sim,point,
             in_axes=(0, None, None, None, None, None, None)
         )
         
+        def inside_time(state):
+            g_v , idx_in_acc = vmapped_update_velocity(jnp.arange(grid_shape[0]), jnp.arange(grid_shape[1]), jnp.arange(grid_shape[2]), state, model, collider, time)
+            state['grid_v_out'] = state['grid_v_out'].at[idx_in_acc[...,0],idx_in_acc[...,1],idx_in_acc[...,2],:].set(g_v)
+            return state['grid_v_out']
+        
+
         def outer_condition(state):
             return jax.lax.cond(
                 (time >= collider['start_time']) & (time < collider['end_time']),
-                lambda state: vmapped_update_velocity(jnp.arange(grid_shape[0]), jnp.arange(grid_shape[1]), jnp.arange(grid_shape[2]), state, model, collider, time),
+                inside_time,
                 lambda state: state['grid_v_out'],
                 state
             )
@@ -588,6 +738,7 @@ def p2g2p(mpm_sim, step, dt):
 
     mpm_state = zero_grid(mpm_state)
     jax.block_until_ready(mpm_state['grid_v_out'])
+    jax.debug.print("AFTER ZERO GRID : Minimum grid out velocity in y-dir is : {a} and its grid_x,grid_y,grid_z is : {b}",a=jnp.min(mpm_state['grid_v_out'][:,:,:,1]), b = jnp.unravel_index(jnp.argmin(mpm_state['grid_v_out'][:,:,:,1]), mpm_state['grid_v_out'][:,:,:,1].shape))
 
     end = time.time()
     jax.debug.print("Zero grid time: {time} ",time= end - start)
@@ -600,15 +751,7 @@ def p2g2p(mpm_sim, step, dt):
     jax.debug.print("Compute stress time: {time} ",time= end - start)
     
 
-    start = time.time()
-    for k in range(0,len(mpm_sim['pre_p2g_operations'])):
-        mpm_state = mpm_sim['pre_p2g_operations'][k](mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['impulse_params'][k])
-
-    # mpm_state = mpm_sim['pre_p2g_operations'][0](mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['impulse_params'][0])
-
-    end = time.time()
-    jax.debug.print("Apply preprocess time: {time} ",time= end - start)
-
+  
 
     start = time.time()
     mpm_state = p2g_apic_with_stress(mpm_state, mpm_model, dt)
@@ -646,6 +789,9 @@ def p2g2p(mpm_sim, step, dt):
     start = time.time()
     for k in range(0,len(mpm_sim['grid_postprocess'])):
         mpm_state = mpm_sim['grid_postprocess'][k](mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][k])
+
+    # mpm_state = collide(mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][1])
+    # mpm_state = bound_grid(mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][0])
     jax.block_until_ready(mpm_state['grid_v_out'])
 
     end = time.time()
