@@ -53,7 +53,7 @@ def kirchoff_stress_water(J, bulk):
 
 
     # clip J between 0.9 and 1.1 
-    J = jnp.clip(J, 0.9, 1.5)
+    # J = jnp.clip(J, 0.9, 1.5)
     pressure = -bulk * (jnp.power(J, -gamma) - 1.0)
     # jax.debug.print("pressure = {pressure}", pressure=pressure)
     # jax.debug.print("J = {J}", J=J)
@@ -75,7 +75,68 @@ def kirchoff_stress_neoHookean(F, U, V, J, sig, mu, lam):
     stress = U @ tau_diag @ V.T @ F.T
     
     return stress
-    
+
+@jax.jit
+def von_mises_return_mapping(F_trial, model, p):
+    # Perform SVD
+    U, sig_old, V = svd3(F_trial)
+
+    # Prevent NaN in extreme cases by clamping singular values
+    sig = jnp.maximum(sig_old, 0.01)
+
+    # Logarithmic strains (natural strains)
+    epsilon = jnp.log(sig)
+    temp = jnp.mean(epsilon)
+
+    # Compute tau (stress)
+    tau = 2.0 * model['mu'][p] * epsilon + model['lam'][p] * jnp.sum(epsilon) * jnp.ones(3)
+    sum_tau = jnp.sum(tau)
+
+    # Deviatoric part of stress
+    cond = tau - sum_tau / 3.0
+
+    # Yield condition check
+    cond_norm = jnp.linalg.norm(cond)
+
+    # Function to handle plastic correction
+    def plastic_correction(_):
+        epsilon_hat = epsilon - temp
+        epsilon_hat_norm = jnp.linalg.norm(epsilon_hat) + 1e-6
+        delta_gamma = epsilon_hat_norm - model['yield_stress'][p] / (2.0 * model['mu'][p])
+        
+        # Update strain
+        epsilon_updated = epsilon - (delta_gamma / epsilon_hat_norm) * epsilon_hat
+
+        # Reconstruct elastic part of F
+        sig_elastic = jnp.diag(jnp.exp(epsilon_updated))
+        F_elastic = U @ sig_elastic @ V.T
+
+        # Hardening condition
+        new_yield_stress = jax.lax.cond(
+            model['hardening'] == 1,
+            lambda _: model['yield_stress'][p] + 2.0 * model['mu'][p] * model['xi'] * delta_gamma,
+            lambda _: model['yield_stress'][p],
+            operand=None
+        )
+
+        # Return F_elastic and updated yield stress
+        return F_elastic, new_yield_stress
+
+    # Function for elastic region, no modification
+    def elastic_region(_):
+        return F_trial, model['yield_stress'][p]
+
+    # Use lax.cond to select between elastic and plastic behavior
+    F_elastic, updated_yield_stress = jax.lax.cond(
+        cond_norm > model['yield_stress'][p],
+        plastic_correction,  # Plastic case
+        elastic_region,      # Elastic case
+        operand=None
+    )
+
+    # Update yield stress in model (if required)
+
+    return F_elastic , updated_yield_stress
 
 
 @jax.jit
@@ -160,20 +221,52 @@ def kirchoff_stress_drucker_prager(F, U, V, sig, mu, lam):
     result = jnp.dot(jnp.dot(jnp.dot(U, center), V.T), F.T)
     return result
 
+def kirchoff_stress_StVK(F, U, V, sig, mu, lam):
+    # Prevent NaN in extreme cases by clamping singular values
+    sig = jnp.maximum(sig, 0.01)
 
+    # Compute logarithmic strain (natural strain)
+    epsilon = jnp.log(sig)
+    log_sig_sum = jnp.sum(jnp.log(sig))
+
+    # Identity vector
+    ONE = jnp.ones(3)
+
+    # Compute stress (tau)
+    tau = 2.0 * mu * epsilon + lam * log_sig_sum * ONE
+
+    # Create a diagonal matrix with tau values
+    tau_diag = jnp.diag(tau)
+
+    # Compute Kirchhoff stress using the formula
+    kirchoff_stress = U @ tau_diag @ V.T @ F.T
+
+    return kirchoff_stress
 
 @jax.jit
 def compute_stress_from_F_trial(state, model, dt):
-    def body(p, state):
+    def body(p, info):
+        state, model = info
         F_trial = state['particle_F_trial'][p]
 
+        
         def compute_if_selected_0(state):
-            F = jax.lax.cond(
+            F, yield_stress = jax.lax.cond(
                 model['material']==2,
-                lambda x: sand_return_mapping(x, state, model, p),
-                lambda x: x,
+                lambda x: (sand_return_mapping(x, state, model, p),0.0),
+                lambda y: jax.lax.cond(
+                model['material']==1,
+                lambda x: von_mises_return_mapping(x, model, p),
+                lambda x: (x , 0.0),
+                y
+            ),
                 F_trial
             )
+
+
+
+
+
             # jax.debug.print("{v_in_add}", v_in_add=F)
 
             J = jnp.linalg.det(F)
@@ -181,24 +274,30 @@ def compute_stress_from_F_trial(state, model, dt):
             stress = jax.lax.cond(
                 model['material']==2,
                 lambda : kirchoff_stress_drucker_prager(F, U, V, sig, model['mu'][p], model['lam'][p]),
-                lambda : kirchoff_stress_water(J, model['bulk'][p]))
+                lambda : jax.lax.cond(
+                    model['material']==1,
+                    lambda : kirchoff_stress_StVK(F, U, V, sig, model['mu'][p], model['lam'][p]),
+                    lambda : kirchoff_stress_water(J, model['bulk'][p])
+                )
+                )
 
 
             stress = (stress + stress.T) / 2.0  
             
-            return F,stress
+            return F, stress , yield_stress
         
-        def compute_else(state):
-            return state['particle_F'][p], state['particle_stress'][p]
+        def compute_else(info):
+            state , model = info
+            return state['particle_F'][p], state['particle_stress'][p] , model['yield_stress'][p]
         
-        pF,pS = jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,state)
-        return pF,pS
+        pF,pS , pYS = jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,(state,model))
+        return pF,pS , pYS
 
     vmap_body = jax.vmap(body, in_axes=(0, None))
-    state['particle_F'], state['particle_stress'] = vmap_body(jnp.arange(state['particle_F'].shape[0]), state)
+    state['particle_F'], state['particle_stress'], model['yield_stress'] = vmap_body(jnp.arange(state['particle_F'].shape[0]), (state,model))
     # jax.debug.print("max_F : {max_F}", max_F=jnp.max(state['particle_F']))
     # jax.debug.print("max_stress : {max_stress}", max_stress=jnp.max(state['particle_stress']))
-    return state
+    return state , model 
 
 
 @jax.jit

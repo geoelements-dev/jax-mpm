@@ -36,7 +36,9 @@ def initialize(n_particles, n_grid=100, grid_lim=1.0, dim=3):
             'gravitational_acceleration': jnp.array([0.0, 0.0, 0.0], dtype=jnp.float64),
             'rpic_damping': jnp.float64(0.0),
             'grid_v_damping_scale': jnp.float64(1.1),
-            'alpha': jnp.sqrt(2.0 / 3.0) * 2.0 * sin_phi / (3.0 - sin_phi)
+            'alpha': jnp.sqrt(2.0 / 3.0) * 2.0 * sin_phi / (3.0 - sin_phi), 
+            'hardening': 0,
+            'xi': 0.0
         },
         'mpm_state': {
             'particle_x': jnp.empty((n_particles, 3), dtype=jnp.float64),
@@ -744,7 +746,7 @@ def p2g2p(mpm_sim, step, dt):
     jax.debug.print("Zero grid time: {time} ",time= end - start)
 
     start = time.time()
-    mpm_state = compute_stress_from_F_trial(mpm_state, mpm_model, dt)
+    mpm_state, mpm_model = compute_stress_from_F_trial(mpm_state, mpm_model, dt)
     jax.block_until_ready(mpm_state['particle_stress'])
 
     end = time.time()
