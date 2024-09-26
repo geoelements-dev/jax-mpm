@@ -38,6 +38,7 @@ def initialize(n_particles, n_grid=100, grid_lim=1.0, dim=3):
             'grid_v_damping_scale': jnp.float64(1.1),
             'alpha': jnp.sqrt(2.0 / 3.0) * 2.0 * sin_phi / (3.0 - sin_phi), 
             'hardening': 0,
+            'softening': 0.1,
             'xi': 0.0
         },
         'mpm_state': {

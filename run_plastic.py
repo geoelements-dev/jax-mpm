@@ -16,11 +16,11 @@ print( "Minimum y" , jnp.min(mpm_solver['mpm_state']['particle_x'][:,1]),"Maximu
 material_params = {
     'E': 2000,
     'nu': 0.2,
-    "material": "metal",
+    "material": "plasticine",
     'friction_angle': 35,
     'g': [0.0, -9.8, 0.0],
     "density": 1000.0 ,
-    'yield_stress': 5000.0,
+    'yield_stress': 1000.0,
     
    
 }
@@ -57,4 +57,4 @@ for k in range(1,4000):
 
 print("Done")
 
-np.save('my_metal_collapse_1.npy', np.array(pos))
+np.save('my_plastic_collapse_1.npy', np.array(pos))
