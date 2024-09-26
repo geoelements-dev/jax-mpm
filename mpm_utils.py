@@ -679,14 +679,14 @@ def g2p(state, model, dt):
             new_cov = jax.lax.cond(
                 model['update_cov_with_F'],
                 lambda state: update_cov(state, p, new_F, dt),
-                lambda state: jax.lax.dynamic_slice(state['particle_cov'], (p*6,), (6,)),
+                lambda state: state['particle_cov'][p * 6 : p * 6 + 6],
                 state
             )
 
             return new_v, new_x, new_C, F_tmp , new_cov 
         
         def identity_fun(p,state):
-            return state['particle_v'][p], state['particle_x'][p], state['particle_C'][p], state['particle_F_trial'][p] ,  jax.lax.dynamic_slice(state['particle_cov'], (p*6,), (6,))
+            return state['particle_v'][p], state['particle_x'][p], state['particle_C'][p], state['particle_F_trial'][p] ,  state['particle_cov'][p * 6 : p * 6 + 6]
         
         pv,px,pc,pf , pcov = jax.lax.cond(state['particle_selection'][p] == 0, lambda state: inside_fun(p,state), lambda state : identity_fun(p,state), state)
         return pv,px,pc,pf , pcov
@@ -743,10 +743,9 @@ def update_cov(state, p, grad_v, dt):
         [state['particle_cov'][p * 6 + 1], state['particle_cov'][p * 6 + 3], state['particle_cov'][p * 6 + 4]],
         [state['particle_cov'][p * 6 + 2], state['particle_cov'][p * 6 + 4], state['particle_cov'][p * 6 + 5]]
     ])
-
-    # jax.debug.print("{v_in_add}", v_in_add=grad_v)
-    # jax.debug.print("{v_in_add}", v_in_add=cov_n)
     
+
+
     cov_np1 = cov_n + dt * (grad_v @ cov_n + cov_n @ grad_v.T)
     
     # state['particle_cov'] = state['particle_cov'].at[p * 6].set(cov_np1[0, 0])
@@ -757,7 +756,6 @@ def update_cov(state, p, grad_v, dt):
     # state['particle_cov'] = state['particle_cov'].at[p * 6 + 5].set(cov_np1[2, 2])
     
     return jnp.array([cov_np1[0, 0], cov_np1[0, 1], cov_np1[0, 2], cov_np1[1, 1], cov_np1[1, 2], cov_np1[2, 2]])
-    # return jnp.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
 
 def save_data_at_frame(mpm_solver, dir_name, frame):
