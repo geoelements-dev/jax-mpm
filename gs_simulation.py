@@ -7,7 +7,8 @@ import argparse
 import torch
 from mpm_solver import *
 import tqdm
-
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 
 
@@ -59,7 +60,8 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    if not os.path.exists(args.model_path):
+   
+    if not os.path.exists(args.model_path) :
         AssertionError("Model path does not exist!")
     if not os.path.exists(args.config):
         AssertionError("Scene config does not exist!")
@@ -83,6 +85,8 @@ if __name__ == "__main__":
     print("Loading gaussians...")
     model_path = args.model_path
     gaussians = load_checkpoint(model_path)
+   
+    
     pipeline = PipelineParamsNoparse()
     pipeline.compute_cov3D_python = True
     background = (
@@ -149,8 +153,86 @@ if __name__ == "__main__":
     init_cov = apply_cov_rotations(init_cov, rotation_matrices)
     init_cov = scale_origin * scale_origin * init_cov
 
+    
+
+
+    print("Max x pos : ", torch.max(transformed_pos[:, 0]))
+    print("Min x pos : ", torch.min(transformed_pos[:, 0]))
+    print("Max y pos : ", torch.max(transformed_pos[:, 1]))
+    print("Min y pos : ", torch.min(transformed_pos[:, 1]))
+    print("Max z pos : ", torch.max(transformed_pos[:, 2]))
+    print("Min z pos : ", torch.min(transformed_pos[:, 2]))
+    
+
     gs_num = transformed_pos.shape[0]
-    mpm_init_pos = transformed_pos.to(device=device)
+    filling_params = preprocessing_params["particle_filling"]
+    
+    
+    data_np = transformed_pos.cpu().detach().numpy()
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Scatter plot of the particles
+    ax.scatter(data_np[:, 0], data_np[:, 1], data_np[:, 2], c=data_np[:, 2], cmap='viridis')
+
+    # Label axes
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    plt.title("3D Scatter Plot of Particles")
+
+    plt.show()
+
+    
+
+    if filling_params is not None:
+        print("Filling internal particles...")
+        
+        mpm_init_pos = j2t(fill_particles(
+            pos=t2j(transformed_pos),
+            opacity=t2j(init_opacity),
+            cov=t2j(init_cov),
+            grid_n=filling_params["n_grid"],
+            max_samples=filling_params["max_particles_num"],
+            grid_dx=material_params["grid_lim"] / filling_params["n_grid"],
+            density_thres=filling_params["density_threshold"],
+            search_thres=filling_params["search_threshold"],
+            max_particles_per_cell=filling_params["max_partciels_per_cell"],
+            search_exclude_dir=filling_params["search_exclude_direction"],
+            ray_cast_dir=filling_params["ray_cast_direction"],
+            boundary=filling_params["boundary"],
+            smooth=filling_params["smooth"],
+        )).to(device=device)
+
+        
+    else:
+        mpm_init_pos = transformed_pos.to(device=device)
+
+        
+    data_np = mpm_init_pos.cpu().detach().numpy()
+
+    fig = plt.figure(figsize=(8, 6))
+    ax = fig.add_subplot(111, projection='3d')
+
+    # Scatter plot of the particles
+    ax.scatter(data_np[:, 0], data_np[:, 1], data_np[:, 2], c=data_np[:, 2], cmap='viridis')
+
+    # Label axes
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+    plt.title("3D Scatter Plot of Particles")
+
+    plt.show()
+
+    # Printing min,max and mean positions 
+
+    print("Min position: ", torch.min(mpm_init_pos, 0))
+    print("Max position: ", torch.max(mpm_init_pos, 0))
+    print("Mean position: ", torch.mean(mpm_init_pos, 0))
+
+
     mpm_init_vol = get_particle_volume(
         mpm_init_pos,
         material_params["n_grid"],
@@ -158,18 +240,38 @@ if __name__ == "__main__":
         uniform=material_params["material"] == "sand",
     ).to(device=device)
 
-    mpm_init_cov = torch.zeros((mpm_init_pos.shape[0], 6), device=device)
-    mpm_init_cov[:gs_num] = init_cov
-    shs = init_shs
-    opacity = init_opacity
 
 
-    mpm_solver = load_initial_data_from_torch(mpm_init_pos, mpm_init_vol, mpm_init_cov, n_grid=150, grid_lim=1.0,init_cov=True)
+    if filling_params is not None and filling_params["visualize"] == True:
+        shs, opacity, mpm_init_cov = init_filled_particles(
+            mpm_init_pos[:gs_num],
+            init_shs,
+            init_cov,
+            init_opacity,
+            mpm_init_pos[gs_num:],
+        )
+        gs_num = mpm_init_pos.shape[0]
+    else:
+        mpm_init_cov = torch.zeros((mpm_init_pos.shape[0], 6), device=device)
+        mpm_init_cov[:gs_num] = init_cov
+        shs = init_shs
+        opacity = init_opacity
+
+
+  
+
+
+
+    mpm_solver = load_initial_data_from_torch(mpm_init_pos, mpm_init_vol, mpm_init_cov, n_grid=150, grid_lim=2,init_cov=True)
     mpm_solver['mpm_model'],mpm_solver['mpm_state'] = set_parameters_dict(mpm_solver['mpm_model'],mpm_solver['mpm_state'], material_params)
 
     mpm_solver['mpm_state'],mpm_solver['mpm_model'] = finalize_mu_lam(mpm_solver['mpm_state'],mpm_solver['mpm_model']) # set mu and lambda from the E and nu input
     mpm_solver = add_grid_boundaries(mpm_solver)
-    mpm_solver = add_surface_collider( mpm_solver , (0.0, 0, 1), (0.0,0.0,1.0), 'slip', 0)
+    mpm_solver = add_surface_collider( mpm_solver , (0, 0.5, 0), (0.0,1.0,0.0), 'slip', 0.1)
+    mpm_solver = add_surface_collider( mpm_solver , (0, 1.5, 0), (0.0,-1.0,0.0), 'slip', 0.1)
+    mpm_solver = add_surface_collider( mpm_solver , (0.5335, 0, 0), (1.0,0.0,0.0), 'slip', 0.1)
+    mpm_solver = add_surface_collider( mpm_solver , (1.4665, 0, 0), (-1.0,0.0,0.0), 'slip', 0.1)
+    mpm_solver = add_surface_collider( mpm_solver , (0, 0, 0.9558), (0.0,0.0,1.0), 'slip', 0.1)
 
     mpm_space_viewpoint_center = (
         torch.tensor(camera_params["mpm_space_viewpoint_center"]).reshape((1, 3)).cuda()
@@ -295,7 +397,7 @@ if __name__ == "__main__":
         # fps = int(1.0 / time_params["frame_dt"])
         fps = 5
         os.system(
-            f"ffmpeg -framerate {fps} -i {args.output_path}/%04d.png -c:v libx264 -s {width}x{height} -y -pix_fmt yuv420p {args.output_path}/output.mp4"
+            f"ffmpeg -framerate {fps} -i {args.output_path}/%04d.png -s {width}x{height} -y -pix_fmt yuv420p {args.output_path}/output.mp4"
         )
 
 
