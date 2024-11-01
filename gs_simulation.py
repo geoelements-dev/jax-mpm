@@ -168,27 +168,18 @@ if __name__ == "__main__":
     filling_params = preprocessing_params["particle_filling"]
     
     
-    data_np = transformed_pos.cpu().detach().numpy()
 
-    fig = plt.figure(figsize=(8, 6))
-    ax = fig.add_subplot(111, projection='3d')
-
-    # Scatter plot of the particles
-    ax.scatter(data_np[:, 0], data_np[:, 1], data_np[:, 2], c=data_np[:, 2], cmap='viridis')
-
-    # Label axes
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    plt.title("3D Scatter Plot of Particles")
-
-    plt.show()
+   
 
     
 
     if filling_params is not None:
         print("Filling internal particles...")
-        
+        transformed_pos , init_opacity , init_cov = reduce_particles_in_cell(transformed_pos, init_opacity, init_cov, 
+                                                                             material_params["grid_lim"] / filling_params["n_grid"], 
+                                                                             filling_params["n_grid"], 
+                                                                             filling_params["reduce_particles_to"])
+
         mpm_init_pos = j2t(fill_particles(
             pos=t2j(transformed_pos),
             opacity=t2j(init_opacity),
@@ -198,7 +189,7 @@ if __name__ == "__main__":
             grid_dx=material_params["grid_lim"] / filling_params["n_grid"],
             density_thres=filling_params["density_threshold"],
             search_thres=filling_params["search_threshold"],
-            max_particles_per_cell=filling_params["max_partciels_per_cell"],
+            max_particles_per_cell=filling_params["max_particles_per_cell"],
             search_exclude_dir=filling_params["search_exclude_direction"],
             ray_cast_dir=filling_params["ray_cast_direction"],
             boundary=filling_params["boundary"],
@@ -209,7 +200,7 @@ if __name__ == "__main__":
     else:
         mpm_init_pos = transformed_pos.to(device=device)
 
-        
+
     data_np = mpm_init_pos.cpu().detach().numpy()
 
     fig = plt.figure(figsize=(8, 6))
@@ -225,6 +216,10 @@ if __name__ == "__main__":
     plt.title("3D Scatter Plot of Particles")
 
     plt.show()
+        
+    # data_np = mpm_init_pos.cpu().detach().numpy()
+    # np.savez("particle_positions.npz", positions=data_np)
+
 
     # Printing min,max and mean positions 
 

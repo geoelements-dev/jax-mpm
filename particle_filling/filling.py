@@ -7,82 +7,70 @@ import torch
 import plotly.graph_objects as go
 from mpm_utils import t2j, j2t
 from scipy.spatial import cKDTree
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 
 
 
-# def find_closest_attributes(p, pos, shs, opacity, cov, dist_batch_size=1024):
-#     min_dist = float('inf')
-#     min_idx = 0
 
-#     # Process `pos` in smaller batches to manage memory better
-#     for i in range(0, pos.shape[0], dist_batch_size):
-#         pos_batch = pos[i:i + dist_batch_size]
-#         print("pbatch: "  , pos_batch)
-#         print("P: ", p)
-#         print("Diff ", pos_batch - p)
-#         # Calculate distances for the current batch
-#         dists = jnp.linalg.norm(pos_batch - p, axis=1)
-        
-#         # Find the minimum distance and corresponding index in this batch
-#         batch_min_idx = jnp.argmin(dists)
-#         batch_min_dist = dists[batch_min_idx]
-        
-#         # Update global minimum if the batch minimum is smaller
-#         if batch_min_dist < min_dist:
-#             min_dist = batch_min_dist
-#             min_idx = i + batch_min_idx
 
-#     # Retrieve the attributes for the closest point found
-#     return shs[min_idx], opacity[min_idx], cov[min_idx]
+def reduce_particles_in_cell(pos, opacity, cov, grid_dx, grid_n, max_particles_per_cell):
+    """
+    Reduces the number of particles in each grid cell if it exceeds max_particles_per_cell.
 
-# # Vectorized version for processing multiple points in `new_pos`
-# get_attr_from_closest_batch = jax.vmap(
-#     find_closest_attributes,
-#     in_axes=(0, None, None, None, None)
-# )
+    Parameters:
+    - pos (array): Positions of particles, shape (n_particles, 3).
+    - opacity (array): Opacity values of particles, shape (n_particles,).
+    - cov (array): Covariance of particles, shape (n_particles, 3, 3).
+    - grid_dx (float): Size of each grid cell.
+    - grid_n (int): Number of cells along each axis in the grid.
+    - max_particles_per_cell (int): Maximum allowed particles per cell.
 
-# def get_attr_from_closest(new_pos, pos, shs, opacity, cov, batch_size=1024):
-#     # Initialize lists to accumulate results for each batch
-#     new_shs_batches = []
-#     new_opacity_batches = []
-#     new_cov_batches = []
+    Returns:
+    - new_pos (array): Positions of remaining particles after reduction.
+    - new_opacity (array): Opacity of remaining particles after reduction.
+    - new_cov (array): Covariance of remaining particles after reduction.
+    - mask (array): Boolean mask of remaining particles.
+    """
 
-#     # Process `new_pos` in batches
-#     print("Shape of new_pos: ", new_pos.shape)
-#     for i in range(0, new_pos.shape[0], batch_size):
-#         print("Batch: ", i)
-#         print("Indices of new_pos: ", i, ":", min(i + batch_size, new_pos.shape[0]))
-#         batch_new_pos = new_pos[i:max(i + batch_size, new_pos.shape[0])]
-        
-#         # Apply the vectorized function to the batch
-#         batch_new_shs, batch_new_opacity, batch_new_cov = get_attr_from_closest_batch(
-#             batch_new_pos, pos, shs, opacity, cov
-#         )
-        
-#         # Append results to the list
-#         new_shs_batches.append(batch_new_shs)
-#         new_opacity_batches.append(batch_new_opacity)
-#         new_cov_batches.append(batch_new_cov)
+    if max_particles_per_cell is None:
+        return pos, opacity, cov
     
-#     # Concatenate results from all batches
-#     new_shs = jnp.concatenate(new_shs_batches, axis=0)
-#     new_opacity = jnp.concatenate(new_opacity_batches, axis=0)
-#     new_cov = jnp.concatenate(new_cov_batches, axis=0)
+    
+    cell_indices = jnp.floor(pos / grid_dx).astype(int)
 
-#     return new_shs, new_opacity, new_cov
+    cell_indices = jnp.clip(cell_indices, 0, grid_n - 1)
 
+    cell_1d_indices = cell_indices[:, 0] * (grid_n ** 2) + cell_indices[:, 1] * grid_n + cell_indices[:, 2]
+
+    unique_cells, cell_counts = jnp.unique(cell_1d_indices, return_counts=True)
+
+    mask = jnp.zeros(pos.shape[0], dtype=bool)
+
+    for cell_id, count in zip(unique_cells, cell_counts):
+        cell_mask = jnp.where(cell_1d_indices == cell_id)[0]
+
+        if count <= max_particles_per_cell:
+            selected_indices = cell_mask
+        else:
+            selected_indices = cell_mask[:max_particles_per_cell]
+
+        mask = mask.at[selected_indices].set(True)
+
+    new_pos = pos[mask]
+    new_opacity = opacity[mask]
+    new_cov = cov[mask]
+
+    return new_pos, new_opacity, new_cov
 
 
 def build_kd_tree(pos):
-    # Convert `pos` to a NumPy array for compatibility with cKDTree
     pos_np = jnp.asarray(pos)
     return cKDTree(pos_np)
 
 def get_attr_from_closest(new_pos, kdtree, pos, shs, opacity, cov):
-    # Query the k-D tree to find the closest point in `pos` for each point in `new_pos`
     _, indices = kdtree.query(new_pos)
 
-    # Gather attributes based on the nearest neighbor indices
     new_shs = shs[indices]
     new_opacity = opacity[indices]
     new_cov = cov[indices]
@@ -92,7 +80,6 @@ def get_attr_from_closest(new_pos, kdtree, pos, shs, opacity, cov):
 
 
 def init_filled_particles(pos, shs, cov, opacity, new_pos):
-    # Reshape shs to a 2D array (num_particles, attributes)
     pos = t2j(pos)
     shs = t2j(shs)
     cov = t2j(cov)
@@ -102,20 +89,16 @@ def init_filled_particles(pos, shs, cov, opacity, new_pos):
 
     shs = shs.reshape(pos.shape[0], -1)
     
-    # Reshape position, covariance, and opacity arrays
     pos = pos.reshape(-1, 3)
     cov = cov.reshape(-1, 6)
     opacity = opacity.reshape(-1,1)
 
-    # Initialize new_shs with the mean of `shs`, repeated for the number of new positions
     new_shs = jnp.mean(shs, axis=0).repeat(new_pos.shape[0]).reshape(new_pos.shape[0], -1)
     
-    # Calculate attributes of the closest particles
     kdtree = build_kd_tree(pos)
 
     new_shs, new_opacity, new_cov = get_attr_from_closest(new_pos,kdtree, pos, shs, opacity, cov)
 
-    # Concatenate original and new attributes
     shs_combined = jnp.concatenate([shs, new_shs], axis=0).reshape(-1, shs.shape[1] // 3, 3)
     opacity_combined = jnp.concatenate([opacity, new_opacity.reshape(-1, 1)], axis=0)
     cov_combined = jnp.concatenate([cov, new_cov], axis=0)
@@ -135,7 +118,6 @@ def compute_density(index, pos, opacity, cov, grid_dx):
         node_pos = (index + shift) * grid_dx
         dist = pos - node_pos
         gaussian_weight += jnp.exp(-0.5 * jnp.dot(dist, cov @ dist))
-        # print("Calculated log gweight: ",  -0.5 * jnp.dot(dist, cov @ dist))
     return opacity * gaussian_weight / 8.0
 
 
@@ -155,17 +137,18 @@ def fill_particles(
     boundary: list = None,
     smooth: bool = False,
 ):
-    pos_clone = jnp.copy(pos)
     
     # Apply boundary conditions
+    pos_clone = jnp.copy(pos)
+
     if boundary is not None:
         assert len(boundary) == 6
-        mask = jnp.ones(pos_clone.shape[0], dtype=bool)
+        mask = jnp.ones(pos.shape[0], dtype=bool)
         max_diff = 0.0
         
         for i in range(3):
-            mask = jnp.logical_and(mask, pos_clone[:, i] > boundary[2 * i])
-            mask = jnp.logical_and(mask, pos_clone[:, i] < boundary[2 * i + 1])
+            mask = jnp.logical_and(mask, pos[:, i] > boundary[2 * i])
+            mask = jnp.logical_and(mask, pos[:, i] < boundary[2 * i + 1])
             max_diff = jnp.maximum(max_diff, boundary[2 * i + 1] - boundary[2 * i])
 
         pos = pos[mask]
@@ -182,17 +165,41 @@ def fill_particles(
     particles = jnp.zeros((max_samples, 3), dtype=float)
     fill_num = 0
 
-    x, y, z = jnp.meshgrid(jnp.arange(grid_n), jnp.arange(grid_n), jnp.arange(grid_n), indexing='ij')
 
-    
+
+
+
+    # data_np = j2t(pos).cpu().detach().numpy()
+
+    # fig = plt.figure(figsize=(8, 6))
+    # ax = fig.add_subplot(111, projection='3d')
+
+    # # Scatter plot of the particles
+    # ax.scatter(data_np[:, 0], data_np[:, 1], data_np[:, 2], c=data_np[:, 2], cmap='viridis')
+
+    # # Label axes
+    # ax.set_xlabel('X')
+    # ax.set_ylabel('Y')
+    # ax.set_zlabel('Z')
+    # plt.title("3D Scatter Plot of Particles")
+
+    # plt.show()
+        
+
+
+
     
     # Compute density_field
     grid, grid_density = densify_grids(pos, opacity, cov, grid, grid_density, grid_dx)
-    print("Max grid density: ", jnp.max(grid_density))
+    
     # Fill dense grids
 
 
     
+
+
+    
+
 
     fill_num , grid , particles = fill_dense_grids(
         grid,
@@ -204,7 +211,7 @@ def fill_particles(
         max_particles_per_cell,
         rng_key=jax.random.PRNGKey(0)
     )
-    print("after dense grids: ", fill_num)
+    print("New particles due to dense grids: ", fill_num)
 
     
 
@@ -213,22 +220,32 @@ def fill_particles(
         df = np.array(grid_density)
         smoothed_df = mcubes.smooth(df, method = "constrained" ,  max_iters=500).astype(np.float32)
         grid_density = jnp.array(smoothed_df)
+        
         print("smooth finished")
 
+
+    print("Top 100 grid densities : ", jax.lax.top_k(grid_density.ravel(), 100))
+    print("Top 100 cells with particles: ", jax.lax.top_k(grid.ravel(), 100))
+
+
+    x, y, z = jnp.meshgrid(jnp.arange(grid_n), jnp.arange(grid_n), jnp.arange(grid_n), indexing='ij')
+
+    # Convert isomin and isomax to Python float
+    # isomin = float(grid_density.min())
+    # isomax = float(grid_density.max())
+
+    # fig = go.Figure(data=go.Volume(
+    #     x=x.flatten(), y=y.flatten(), z=z.flatten(),
+    #     value=grid_density.flatten(),
+    #     isomin=isomin,
+    #     isomax=isomax,
+    #     opacity=0.1,  # Adjust opacity for better visualization
+    #     surface_count=15,  # Number of isosurfaces
+    # ))
+
+    # fig.show()
+
     
-    isomin = float(grid_density.min())
-    isomax = float(grid_density.max())
-
-    fig = go.Figure(data=go.Volume(
-        x=x.flatten(), y=y.flatten(), z=z.flatten(),
-        value=grid_density.flatten(),
-        isomin=isomin,
-        isomax=isomax,
-        opacity=0.1,  # Adjust opacity for better visualization
-        surface_count=15,  # Number of isosurfaces
-    ))
-
-    fig.show()
 
     # Fill internal grids
     particles , fill_num = internal_filling(
@@ -243,7 +260,7 @@ def fill_particles(
         threshold=search_thres,
         key=jax.random.PRNGKey(0)
     )
-    print("after internal grids: ", fill_num)
+    print("New particles due to internal grids and dense grids: ", fill_num)
 
     # Concatenate new particles with the original ones
     particles_tensor = particles[:fill_num]
@@ -360,8 +377,6 @@ def densify_grids(init_particles, opacity, cov_upper, grid, grid_density, grid_d
     vmap_body_1 = jax.vmap(body_1)
     grid_pos_all, cov_all, r_all  = vmap_body_1(jnp.arange(init_particles.shape[0]))
     grid = grid.at[grid_pos_all[...,0],grid_pos_all[...,1],grid_pos_all[...,2]].add(1)
-    print("Max particles in grid: ", jnp.max(grid))
-
     for k in range(0,(-(-grid_pos_all.shape[0]//batch_size))):
         voxel_pos_all = compute_filtered_voxel_positions(init_particles.shape[0], r_all, grid_pos_all,batch_no=k, batch_size=batch_size)
         def body_fun(i,vp):  
@@ -484,42 +499,57 @@ def fill_dense_grids(
     max_particles_per_cell,
     rng_key
 ):
-    # Step 1: Compute `diff_all` (number of particles needed per cell based on density threshold)
-    def compute_diff(density, grid_val):
-        return jnp.maximum(0, max_particles_per_cell - grid_val) * (density > density_thres)
-
-    # Vectorized calculation of `diff_all` across grid
-    diff_all = jax.vmap(compute_diff)(grid_density.ravel(), grid.ravel())  # Shape: (n_cells,)
-    # Step 2: Repeat grid indices based on `diff_all`
+    # Step 1: Get all grid indices
     grid_shape = grid.shape
     grid_indices = jnp.array(jnp.meshgrid(
         jnp.arange(grid_shape[0]), jnp.arange(grid_shape[1]), jnp.arange(grid_shape[2]),
         indexing="ij"
-    )).reshape(3, -1).T  # Shape: (n_cells, 3)
-    
-    # Expanding grid indices based on `diff_all`
-    repeated_indices = jnp.repeat(grid_indices, diff_all, axis=0)  # Shape: (total_particles, 3)
-    
-    # Step 3: Generate random displacements
-    total_particles = repeated_indices.shape[0]
-    random_disps = jax.random.uniform(rng_key, shape=(total_particles, 3)) * grid_dx  # Shape: (total_particles, 3)
+    )).reshape(-1, 3)  # Shape: (n_cells, 3)
 
-    # Step 4: Compute new particle positions and concatenate with `new_particles`
+    # Step 2: Compute `diff_all` based on the density threshold and max particle constraint
+    def compute_diff(indices):
+        # Retrieve grid values and densities at the given index
+        i, j, k = indices
+        grid_val = grid[i, j, k]
+        density = grid_density[i, j, k]
+        diff = jnp.maximum(0, max_particles_per_cell - grid_val) * (density > density_thres)
+        return diff, indices
+
+    # Map over grid indices to calculate `diff_all` and retain indices
+    diff_all, indices_all = jax.vmap(compute_diff)(grid_indices)  # Shapes: (n_cells,), (n_cells, 3)
+
+    # Filter for cells with `diff > 0`
+    nonzero_mask = diff_all > 0
+    nonzero_diffs = diff_all[nonzero_mask]       # Shape: (nonzero_cells,)
+    nonzero_indices = indices_all[nonzero_mask]  # Shape: (nonzero_cells, 3)
+
+    # Step 3: Repeat `nonzero_indices` based on `nonzero_diffs`
+    repeated_indices = jnp.repeat(nonzero_indices, nonzero_diffs, axis=0)  # Shape: (total_particles, 3)
+    total_particles = repeated_indices.shape[0]
+
+    # Step 4: Generate random displacements and compute new particle positions
+    random_disps = jax.random.uniform(rng_key, shape=(total_particles, 3)) * grid_dx  # Shape: (total_particles, 3)
     new_particle_positions = repeated_indices * grid_dx + random_disps  # Shape: (total_particles, 3)
 
-    # Step 5: Update grid where particles were added
-    def update_grid_val(grid_val, diff):
-        return jnp.where(diff > 0, max_particles_per_cell, grid_val)
+
+    # Step 6: Update `grid` for cells where particles were added
+    def update_grid_val(indices, diff):
+        # Only set grid to max_particles_per_cell if `diff > 0`
+        i, j, k = indices
+        grid_val = grid[i, j, k]
+        new_grid_val = jnp.where(diff > 0, max_particles_per_cell, grid_val)
+        return new_grid_val, indices
     
-    updated_grid = jax.vmap(update_grid_val)(grid.ravel(), diff_all).reshape(grid_shape)
+    # Map over indices to update the grid
+    updated_grid_vals, updated_indices = jax.vmap(update_grid_val)(nonzero_indices, nonzero_diffs)
+    
+    # Place updated values back into the grid
+    updated_grid = grid.at[tuple(updated_indices.T)].set(updated_grid_vals)
 
-    # Step 6: Update start_idx based on the number of new particles added
+    # Step 7: Update `start_idx` based on the number of new particles added
     new_start_idx = start_idx + total_particles
-    print("total particles: ", total_particles)
-    print("start_idx: ", start_idx)
 
-    return new_start_idx, updated_grid, new_particle_positions 
-
+    return new_start_idx, updated_grid, new_particle_positions
 
 def internal_filling(
     grid,
@@ -543,23 +573,23 @@ def internal_filling(
         index = jnp.array([i, j, k])
         
         # Check collision for non-excluded directions
-        hit_check_fn = lambda d: (d != exclude_dir) & collision_search( grid_density, index , d , grid_shape,threshold)
+        hit_check_fn = lambda d: (d == exclude_dir) | (collision_search( grid_density, index , d , grid_shape,threshold))
         collision_hit = jax.vmap(hit_check_fn)(jnp.arange(6)).all()
 
         # Check hit times along ray_cast_dir
-        hit_times = collision_times(grid,grid_density,index, ray_cast_dir, grid_shape , threshold)
+        # hit_times = collision_times(grid,grid_density,index, ray_cast_dir, grid_shape , threshold)
         
-        print("Collision hit: ", collision_hit , "Hit times: ", hit_times , "Cell filled: ", cell_filled , "Index: ", index)
+        # print("Collision hit: ", collision_hit , "Hit times: ", hit_times , "Cell filled: ", cell_filled , "Index: ", index)
        
 
         
 
-        return jnp.maximum(0,max_particles_per_cell - cell_filled)*((cell_filled == 0) & collision_hit & (hit_times % 2 == 1))
+        return jnp.maximum(0,max_particles_per_cell - cell_filled)*((cell_filled < max_particles_per_cell) & collision_hit ) , index
             
 
     # Process all cells and flatten results
-    diff_all = jax.vmap(process_cell,in_axes=(0))(indices)
-    repeated_indices = jnp.repeat(indices, diff_all, axis=0)  # Shape: (total_particles, 3)
+    diff_all , corresponding_indices = jax.vmap(process_cell,in_axes=(0))(indices)
+    repeated_indices = jnp.repeat(corresponding_indices, diff_all, axis=0)  # Shape: (total_particles, 3)
     
     # Step 3: Generate random displacements
     total_particles = repeated_indices.shape[0]
@@ -570,11 +600,9 @@ def internal_filling(
 
 
 
-    # Concatenate with existing new_particles and update start index
-    new_particles = jnp.concatenate([new_particles, new_particle_positions], axis=0)
-    new_start_idx = new_particles.shape[0]
+    new_start_idx = start_idx + new_particle_positions.shape[0]
     
-    return new_particles, new_start_idx
+    return new_particle_positions, new_start_idx
 
 
 def get_particle_volume(pos, grid_n: int, grid_dx: float, uniform:bool=False,):

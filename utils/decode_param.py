@@ -152,8 +152,8 @@ def decode_param_json(json_file):
         if not "max_particles_num" in filling_params.keys():
             filling_params["max_particles_num"] = 2000000
 
-        if not "max_partciels_per_cell" in filling_params.keys():
-            filling_params["max_partciels_per_cell"] = 1
+        if not "max_particles_per_cell" in filling_params.keys():
+            filling_params["max_particles_per_cell"] = 1
 
         if not "search_exclude_direction" in filling_params.keys():
             filling_params["search_exclude_direction"] = 5
@@ -169,6 +169,10 @@ def decode_param_json(json_file):
         
         if not "visualize" in filling_params.keys():
             filling_params["visualize"] = False
+
+        if not "reduce_particles_to" in filling_params.keys():
+            filling_params["reduce_particles_to"] = None
+
     else:
         preprocessing_params["particle_filling"] = None
 
