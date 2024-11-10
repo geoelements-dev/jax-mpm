@@ -7,6 +7,7 @@ jax.config.update("jax_enable_x64", True)
 
 from torch.utils import dlpack as torch_dlpack
 from jax import dlpack as jax_dlpack
+from svd_safe import svd
 
 
 def j2t(x_jax):
@@ -184,7 +185,7 @@ def compute_mu_lam_from_E_nu(mpm_state, mpm_model):
 
 @jax.jit
 def svd3(F):
-    U, S, Vh = jnp.linalg.svd(F)
+    U, S, Vh = svd(F)
     return U, S, Vh.T
 
 @jax.jit
@@ -194,7 +195,7 @@ def sand_return_mapping(F_trial, state, model, p):
     epsilon = jnp.array([jnp.log(jnp.clip(jnp.abs(sig[0]),1e-14)), jnp.log(jnp.clip(jnp.abs(sig[1]),1e-14)), jnp.log(jnp.clip(jnp.abs(sig[2]),1e-14))]).T
     tr = jnp.sum(epsilon)
     epsilon_hat = epsilon - tr / 3.0
-    epsilon_hat_norm = jnp.linalg.norm(epsilon_hat)
+    epsilon_hat_norm = jnp.linalg.norm(jnp.clip((epsilon_hat),1e-8))
     delta_gamma = epsilon_hat_norm + (3.0 * model['lam'][p] + 2.0 * model['mu'][p]) / (2.0 * model['mu'][p]) * tr * model['alpha']
     # jax.debug.print("{delta_gamma}", delta_gamma=model['mu'][p])
     # jax.debug.callback(log_array,('jax_log.txt', 'delta_gamma', delta_gamma, 0))
@@ -227,7 +228,7 @@ def kirchoff_stress_drucker_prager(F, U, V, sig, mu, lam):
 @jax.jit
 def von_mises_return_mapping_with_damage(F_trial, model, p):
     # SVD of F_trial
-    U, sig_old, V = jnp.linalg.svd(F_trial)
+    U, sig_old, V = svd3(F_trial)
     
     # Prevent NaN in extreme cases
     sig = jnp.maximum(sig_old, 0.01)
@@ -344,13 +345,15 @@ def compute_stress_from_F_trial(state, model, dt):
     def body(p, info):
         state, model = info
         F_trial = state['particle_F_trial'][p]
+        # jax.debug.print("{F}",F=F_trial)
 
         
-        def compute_if_selected_0(state):
+        def compute_if_selected_0(state,model):
             F, yield_stress , new_mu , new_lam = jax.lax.cond(
                 model['material']==2,
                 lambda x: (sand_return_mapping(x, state, model, p),0.0,model['mu'][p],model['lam'][p]),
-                lambda y: jax.lax.cond(
+                lambda y:          
+                jax.lax.cond(
                 model['material']==1,
                 lambda x: von_mises_return_mapping(x, model, p) + (model['mu'][p],model['lam'][p]),
                 lambda x: jax.lax.cond(
@@ -401,8 +404,10 @@ def compute_stress_from_F_trial(state, model, dt):
         def compute_else(info):
             state , model = info
             return state['particle_F'][p], state['particle_stress'][p] , model['yield_stress'][p] , model['mu'][p] , model['lam'][p]
-        
-        pF,pS , pYS , pMu , pLam = jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,(state,model))
+
+        with jax.checking_leaks():
+            pF,pS , pYS , pMu , pLam = compute_if_selected_0(state,model)
+        # jax.lax.cond(state['particle_selection'][p] == 0, compute_if_selected_0, compute_else,(state,model))
         return pF,pS , pYS , pMu , pLam
 
     vmap_body = jax.vmap(body, in_axes=(0, None))
@@ -676,19 +681,21 @@ def g2p(state, model, dt):
             #     state
             # )
 
-            new_cov = jax.lax.cond(
-                model['update_cov_with_F'],
-                lambda state: update_cov(state, p, new_F, dt),
-                lambda state: jax.lax.dynamic_slice(state['particle_cov'], (p*6,), (6,)),
-                state
-            )
+            new_cov = update_cov(state, p, new_F, dt)
+            # jax.lax.cond(
+            #     model['update_cov_with_F'],
+            #     lambda state: update_cov(state, p, new_F, dt),
+            #     lambda state: state['particle_cov'].reshape(-1,6)[p],
+            #     state
+            # )
 
             return new_v, new_x, new_C, F_tmp , new_cov 
         
         def identity_fun(p,state):
-            return state['particle_v'][p], state['particle_x'][p], state['particle_C'][p], state['particle_F_trial'][p] ,  jax.lax.dynamic_slice(state['particle_cov'], (p*6,), (6,))
+            return state['particle_v'][p], state['particle_x'][p], state['particle_C'][p], state['particle_F_trial'][p] ,  state['particle_cov'].reshape(-1,6)[p]
         
-        pv,px,pc,pf , pcov = jax.lax.cond(state['particle_selection'][p] == 0, lambda state: inside_fun(p,state), lambda state : identity_fun(p,state), state)
+        pv,px,pc,pf , pcov = inside_fun(p,state)
+        # jax.lax.cond(state['particle_selection'][p] == 0, lambda state: inside_fun(p,state), lambda state : identity_fun(p,state), state)
         return pv,px,pc,pf , pcov
     
     vmap_body = jax.vmap(body_fun, in_axes=(0, None))

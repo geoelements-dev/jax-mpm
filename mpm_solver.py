@@ -202,7 +202,7 @@ def set_parameters_dict(mpm_model, mpm_state, kwargs={}):
     mpm_model['grid_dim_x'] = n_grid
     mpm_model['grid_dim_y'] = n_grid
     mpm_model['grid_dim_z'] = n_grid
-    mpm_model['dx'], mpm_model['inv_dx'] = grid_lim / n_grid, float(n_grid / grid_lim)
+    mpm_model['dx'], mpm_model['inv_dx'] = grid_lim / n_grid, (n_grid / grid_lim)
 
     mpm_state['grid_m'] = jnp.zeros((n_grid, n_grid, n_grid), dtype=float)
     mpm_state['grid_v_in'] = jnp.zeros((n_grid, n_grid, n_grid, 3), dtype=float)
@@ -251,7 +251,7 @@ def set_parameters_dict(mpm_model, mpm_state, kwargs={}):
 
 
 
-
+@jax.jit 
 def finalize_mu_lam(mpm_state, mpm_model):
     mpm_state, mpm_model = compute_mu_lam_from_E_nu(mpm_state, mpm_model)
     return mpm_state, mpm_model
@@ -729,45 +729,18 @@ def add_surface_collider(mpm_sim,point,
 
 
 def p2g2p(mpm_sim, step, dt):
-    start = time.time()
-
+    print("Step: ", step)
     mpm_state = mpm_sim['mpm_state']
     mpm_model = mpm_sim['mpm_model']
-    end = time.time()
-    jax.debug.print("Time taken to unpack: {time}", time = end - start)
-    # grid_size = jnp.array([mpm_model['grid_dim_x'], mpm_model['grid_dim_y'], mpm_model['grid_dim_z']])
-
-    start = time.time()
-
-    mpm_state = zero_grid(mpm_state)
-    jax.block_until_ready(mpm_state['grid_v_out'])
-    jax.debug.print("AFTER ZERO GRID : Minimum grid out velocity in y-dir is : {a} and its grid_x,grid_y,grid_z is : {b}",a=jnp.min(mpm_state['grid_v_out'][:,:,:,1]), b = jnp.unravel_index(jnp.argmin(mpm_state['grid_v_out'][:,:,:,1]), mpm_state['grid_v_out'][:,:,:,1].shape))
-
-    end = time.time()
-    jax.debug.print("Zero grid time: {time} ",time= end - start)
-
-    start = time.time()
-    mpm_state, mpm_model = compute_stress_from_F_trial(mpm_state, mpm_model, dt)
-    jax.block_until_ready(mpm_state['particle_stress'])
-
-    end = time.time()
-    jax.debug.print("Compute stress time: {time} ",time= end - start)
     
-
-  
-
-    start = time.time()
+    mpm_state = zero_grid(mpm_state)
+    
+    mpm_state, mpm_model = compute_stress_from_F_trial(mpm_state, mpm_model, dt)
+    
     mpm_state = p2g_apic_with_stress(mpm_state, mpm_model, dt)
-    jax.block_until_ready(mpm_state['grid_v_in'])
-    end = time.time()
-    jax.debug.print("P2G time: {time} ", time = end - start)
-
-    start = time.time()
+    
     mpm_state = grid_normalization_and_gravity(mpm_state, mpm_model, dt)
-    jax.block_until_ready(mpm_state['grid_v_out'])
-
-    end = time.time()
-    jax.debug.print("Grid normalization time: {time} ", time = end - start)
+   
 
     # Convert the if statement to JAX compatible using lax.cond
 
@@ -795,23 +768,11 @@ def p2g2p(mpm_sim, step, dt):
 
     # mpm_state = collide(mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][1])
     # mpm_state = bound_grid(mpm_sim['time'], dt, mpm_state, mpm_model, mpm_sim['collider_params'][0])
-    jax.block_until_ready(mpm_state['grid_v_out'])
-
-    end = time.time()
-    jax.debug.print("Apply postprocess time: {time} ",time= end - start)
-
-    # jax.debug.print("Printing state :{s} ", s = mpm_state)
-    jax.debug.print("Minimum grid out velocity in y-dir is : {a} and its grid_x,grid_y,grid_z is : {b}",a=jnp.min(mpm_state['grid_v_out'][:,:,:,1]), b = jnp.unravel_index(jnp.argmin(mpm_state['grid_v_out'][:,:,:,1]), mpm_state['grid_v_out'][:,:,:,1].shape))
-    start = time.time()
+   
     mpm_state = g2p(mpm_state, mpm_model, dt)
-    jax.block_until_ready(mpm_state['particle_F_trial'])
-
-    end = time.time()
-    jax.debug.print("G2P time: {time}", time = end - start)
 
     mpm_sim['time'] += dt
     mpm_sim['mpm_state'] = mpm_state
-    jax.debug.print("Ho")
     return mpm_sim
 
 # def mpm_solve(mpm_solver,n_steps,dt):
